@@ -1,4 +1,5 @@
-# For a project where a deploy costs something a person should acknowledge.
+# For a project where a deploy interrupts work in progress and a person should
+# have to acknowledge it.
 
 name: CD
 
@@ -12,10 +13,11 @@ on:
 
 jobs:
   deploy:
+    environment: production
     uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@main
     with:
+      aws-account-id: "294342039646"
       cluster: agency-prod
-      health-url: https://api.franchiseos.example.com/health
+      health-url: https://api.example.com/health
       require-confirm: true
       confirm: ${{ inputs.confirm }}
-    secrets: inherit

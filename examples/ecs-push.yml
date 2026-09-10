@@ -1,28 +1,23 @@
-# The ordinary case: merging to main deploys to prod, merging to develop
-# deploys to dev. Copy this to .github/workflows/cd.yml in the project.
+# Copy to .github/workflows/cd.yml in the project.
 #
-# Notice what is *not* here: no project name, no ECR repository, no service.
-# Those are derived from the calling repository by the registry in
-# exerra-ai-org/deploy, so this repository can only ever deploy itself.
+# Notice what is not here: no secrets block, no role ARN, no project name, no
+# ECR repository, no service. The app is derived from this repository and the
+# role ARN follows from it, so a repository can only ever deploy itself.
+#
+# `environment:` is required. It is half of the OIDC subject, so without it the
+# token says :ref:refs/heads/main and matches no trust policy.
 
 name: CD
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
 
 jobs:
-  prod:
-    if: github.ref == 'refs/heads/main'
+  deploy:
+    environment: production
     uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@main
     with:
+      aws-account-id: "294342039646"
       cluster: agency-prod
-      health-url: https://api.acrm.example.com/health
-    secrets: inherit
-
-  dev:
-    if: github.ref == 'refs/heads/develop'
-    uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@main
-    with:
-      cluster: agency-dev
-    secrets: inherit
+      health-url: https://api.example.com/health

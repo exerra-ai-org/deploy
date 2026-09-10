@@ -31,8 +31,10 @@ jobs:
 
   deploy:
     needs: build
+    environment: production
     uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@main
     with:
+      aws-account-id: "294342039646"
       artifact-name: release-${{ github.sha }}
       install-root: /opt/dialer
       service: dialer
@@ -44,4 +46,3 @@ jobs:
       aws-region: us-east-1
       require-confirm: true
       confirm: ${{ inputs.confirm }}
-    secrets: inherit

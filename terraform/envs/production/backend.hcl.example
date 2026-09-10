@@ -1,0 +1,4 @@
+# cp backend.hcl.example backend.hcl, fill in, then:
+#   terraform init -backend-config=backend.hcl
+bucket = "exerra-tfstate-REPLACE_ACCOUNT_ID"
+region = "us-east-1"
