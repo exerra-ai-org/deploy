@@ -34,6 +34,23 @@ name: Deploy to ECS
 on:
   workflow_call:
     inputs:
+      aws-account-id:
+        description: >-
+          Account the role lives in. An input, not a secret: an account id
+          appears in every ARN in every log, and masking a non-secret is how a
+          wrong value stays invisible -- an INSTANCE_ID secret holding an
+          account id once cost three deploys, because the failing ARN rendered
+          as "managed-instance/***" and read as correct.
+        required: true
+        type: string
+      environment:
+        description: >-
+          GitHub environment, which is half of the OIDC subject and therefore
+          decides which account the token can open. The calling job must declare
+          the same one.
+        required: false
+        type: string
+        default: production
       cluster:
         description: >-
           ECS cluster, e.g. agency-prod. A property of the environment rather
@@ -91,10 +108,6 @@ on:
         required: false
         type: boolean
         default: false
-    secrets:
-      AWS_DEPLOY_ROLE_ARN:
-        description: Role the runner assumes through OIDC. No AWS key is stored anywhere.
-        required: true
 
 concurrency:
   # One deploy per project at a time. Not cancel-in-progress: interrupting a
@@ -146,7 +159,8 @@ jobs:
             "exerra-ai-org/ACRM":       "acrm",
             "exerra-ai-org/franchiseOS":"franchiseos",
             "exerra-ai-org/linkedout":  "linkedout",
-            "exerra-ai-org/rusrus":     "rusrus"
+            "exerra-ai-org/rusrus":     "rusrus",
+            "exerra-ai-org/Truck-Engine":"trucking"
           }
           REGISTRY
 
@@ -170,7 +184,10 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          # Derived, never supplied. The app comes from the calling repository,
+          # so a repository cannot name another app's role -- and a role per app
+          # costs no per-repository secret.
+          role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/exerra-deploy-${{ steps.app.outputs.app }}-${{ inputs.environment }}
           aws-region: ${{ inputs.aws-region }}
 
       - id: ecr

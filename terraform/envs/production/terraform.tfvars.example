@@ -1,0 +1,22 @@
+# cp terraform.tfvars.example terraform.tfvars and fill in.
+# terraform.tfvars is gitignored: this repository is public, and while an account
+# id is not a secret there is no reason to publish one.
+
+aws_account_id    = "REPLACE_ACCOUNT_ID"
+aws_region        = "us-east-1"
+oidc_provider_arn = "arn:aws:iam::REPLACE_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+artifact_bucket   = "wezero-dialer-releases-REPLACE_ACCOUNT_ID"
+
+# IAM -> Policies -> DeploymentPermissionsBoundary -> copy ARN
+permissions_boundary_arn = "arn:aws:iam::REPLACE_ACCOUNT_ID:policy/DeploymentPermissionsBoundary"
+
+# Leave these until an ECS cluster exists in this account. While ecs_cluster_name
+# is null the ECS statements and iam:PassRole are omitted entirely, which is the
+# right default: PassRole is the permission that turns "can deploy" into "can
+# become anything in the account".
+# ecs_cluster_name = "agency-prod"
+# ecr_namespace    = "exerra"
+# task_role_arns   = [
+#   "arn:aws:iam::REPLACE_ACCOUNT_ID:role/agency-prod-ecs-task-execution",
+#   "arn:aws:iam::REPLACE_ACCOUNT_ID:role/agency-prod-ecs-task",
+# ]
