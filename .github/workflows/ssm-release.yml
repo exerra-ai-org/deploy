@@ -140,6 +140,12 @@ jobs:
           set -euo pipefail
           find "rel/${{ inputs.project }}/bin" -type f -exec chmod +x {} + 2>/dev/null || true
           find "rel/${{ inputs.project }}" -path '*/erts-*/bin/*' -type f -exec chmod +x {} + 2>/dev/null || true
+          # releases/<vsn>/elixir and iex too. bin/<app> execs elixir, so
+          # without this the release unpacks and then fails with
+          #   exec: .../releases/0.1.0/elixir: Permission denied
+          # which names the script rather than its mode.
+          find "rel/${{ inputs.project }}" -regextype posix-extended \
+            -regex '.*/releases/[^/]+/(elixir|iex)' -type f -exec chmod +x {} + 2>/dev/null || true
           tar czf "${{ inputs.project }}-${{ github.sha }}.tar.gz" -C rel "${{ inputs.project }}"
           aws s3 cp "${{ inputs.project }}-${{ github.sha }}.tar.gz" \
             "s3://${{ secrets.ARTIFACT_BUCKET }}/releases/"
