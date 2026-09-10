@@ -95,6 +95,56 @@ See [`docs/PROJECT-REQUIREMENTS.md`](./docs/PROJECT-REQUIREMENTS.md). Six
 things, five of which are about the application rather than the infrastructure,
 and those five are where the real work is on an existing project.
 
+## Repository separation
+
+A repository can only deploy itself. The app is **derived from
+`github.repository`** through a registry inside the workflow, never taken as an
+input:
+
+```
+exerra-ai-org/dialer  ->  dialer
+exerra-ai-org/ACRM    ->  acrm
+anything else         ->  refused
+```
+
+Everything that decides what gets touched follows from that name:
+
+| | derived as |
+|---|---|
+| S3 key | `s3://<bucket>/<app>/releases/<app>-<sha>.tar.gz` |
+| SSM target | instances tagged `DeployGroup=<group>` **and** `App=<app>` |
+| ECR repository | `<namespace>/<app>` |
+| ECS service | `<app>-service` |
+| Task family, container | `<app>` |
+
+So a caller cannot address another app's prefix, image or service by passing a
+different value, because there is no value to pass. Adding an app means editing
+the registry in this repository, whose `main` branch requires a review — the
+same gate as the workflow itself.
+
+Instances are targeted **by tag rather than by id** for the same reason: an
+instance id is guessable and was previously an input. Tagging also makes the
+zero-match case explicit — `SendCommand` succeeds against nothing at all and
+reports Success, so the workflow checks that at least one invocation exists and
+fails loudly if not.
+
+### What this does and does not buy
+
+It is enforced by the **workflow**, not by IAM. With one deploy role shared
+across the organisation, IAM sees one principal and cannot tell which repository
+is using it — so the prefix separation holds exactly as long as the only path to
+that role is this workflow. Two things keep it that way:
+
+- the role's trust policy pins `job_workflow_ref` to this file, so a repository
+  cannot write its own workflow and assume the role directly, and
+- `main` here requires a review.
+
+That is a real boundary, but it is a different one from IAM. **Graduate to a
+role per app** when a repository handles something the others should not reach,
+when someone outside the core team gets push access, or when the first
+production-touching repository appears. In Terraform that is a `for_each` over
+the app list; the caller's workflow does not change.
+
 ## Known gap: the IAM trust is org-wide
 
 The roles these workflows assume are created in `aws-agency-infra`, and their

@@ -31,9 +31,8 @@ jobs:
 
   deploy:
     needs: build
-    uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@v1
+    uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@main
     with:
-      project: dialer
       artifact-name: release-${{ github.sha }}
       install-root: /opt/dialer
       service: dialer
@@ -42,7 +41,6 @@ jobs:
       migrate-command: ./bin/dialer eval "Dialer.Release.migrate()"
       environment-file: /etc/dialer/environment
       artifact-bucket: wezero-dialer-releases-294342039646
-      instance-id: i-0ef4363c877223658
       aws-region: us-east-1
       require-confirm: true
       confirm: ${{ inputs.confirm }}

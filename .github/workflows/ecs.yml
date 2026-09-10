@@ -34,31 +34,24 @@ name: Deploy to ECS
 on:
   workflow_call:
     inputs:
-      project:
-        description: Project name. Used for logging and as the default container name.
-        required: true
-        type: string
       cluster:
-        description: ECS cluster, e.g. agency-prod.
+        description: >-
+          ECS cluster, e.g. agency-prod. A property of the environment rather
+          than of the app, so it stays an input. The ECR repository, service,
+          task family and container name are all derived from the calling
+          repository instead -- see the registry step.
         required: true
         type: string
-      service:
-        description: ECS service name.
-        required: true
-        type: string
-      ecr-repository:
-        description: ECR repository name, without the registry host.
-        required: true
-        type: string
-      task-family:
-        description: Task definition family to base the new revision on.
-        required: true
-        type: string
-      container-name:
-        description: Container inside the task definition to point at the new image. Defaults to the project name.
+      ecr-namespace:
+        description: Optional prefix on the ECR repository name, e.g. "exerra".
         required: false
         type: string
         default: ''
+      service-suffix:
+        description: Appended to the app name to form the ECS service name.
+        required: false
+        type: string
+        default: -service
       aws-region:
         required: false
         type: string
@@ -106,12 +99,12 @@ on:
 concurrency:
   # One deploy per project at a time. Not cancel-in-progress: interrupting a
   # deploy half way leaves the service on a revision nobody chose.
-  group: deploy-${{ inputs.project }}-${{ inputs.cluster }}
+  group: deploy-${{ github.repository }}-${{ inputs.cluster }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: ${{ inputs.project }} to ${{ inputs.cluster }}
+    name: ${{ github.repository }} to ${{ inputs.cluster }}
     runs-on: ubuntu-latest
 
     permissions:
@@ -123,9 +116,55 @@ jobs:
         if: inputs.require-confirm
         run: |
           if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
-            echo "::error::Type DEPLOY to confirm. This restarts ${{ inputs.project }}."
+            echo "::error::Type DEPLOY to confirm. This restarts ${{ github.repository }}."
             exit 1
           fi
+
+      # ---- who is calling, and what may they touch -------------------------
+      #
+      # The app is derived from the calling repository, never taken as an
+      # input. That is the whole separation: a repository can only ever write
+      # to its own S3 prefix and send commands to its own instances, whatever
+      # it passes in.
+      #
+      # Taking `app` as an input would make the prefixes housekeeping rather
+      # than a boundary -- any repository could call this workflow with another
+      # app's name and deploy over it. The registry below is the boundary, and
+      # it lives in this file, in a repository whose main branch requires a
+      # review, so adding an app is a reviewed change rather than a workflow
+      # input.
+      #
+      # A repository not listed here cannot deploy at all, which is the correct
+      # default for a role trusted by an entire organisation.
+      - name: Resolve the calling repository to an app
+        id: app
+        run: |
+          set -euo pipefail
+          cat > /tmp/apps.json <<'REGISTRY'
+          {
+            "exerra-ai-org/dialer":     "dialer",
+            "exerra-ai-org/ACRM":       "acrm",
+            "exerra-ai-org/franchiseOS":"franchiseos",
+            "exerra-ai-org/linkedout":  "linkedout",
+            "exerra-ai-org/rusrus":     "rusrus"
+          }
+          REGISTRY
+
+          app=$(jq -r --arg r "${{ github.repository }}" '.[$r] // empty' /tmp/apps.json)
+
+          if [ -z "$app" ]; then
+            echo "::error::${{ github.repository }} is not a registered app."
+            echo "::error::Add it to the registry in exerra-ai-org/deploy and get the change reviewed."
+            exit 1
+          fi
+
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "Calling repository ${{ github.repository }} resolves to app '$app'"
+
+          ns="${{ inputs.ecr-namespace }}"
+          echo "ecr-repository=${ns:+$ns/}$app" >> "$GITHUB_OUTPUT"
+          echo "service=${app}${{ inputs.service-suffix }}" >> "$GITHUB_OUTPUT"
+          echo "task-family=$app" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
 
@@ -142,7 +181,7 @@ jobs:
       - name: Build and push
         id: image
         env:
-          URI: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}
+          URI: ${{ steps.ecr.outputs.registry }}/${{ steps.app.outputs.ecr-repository }}:${{ github.sha }}
         run: |
           set -euo pipefail
           docker build \
@@ -160,7 +199,7 @@ jobs:
           set -euo pipefail
           arn=$(aws ecs describe-services \
             --cluster "${{ inputs.cluster }}" \
-            --services "${{ inputs.service }}" \
+            --services "${{ steps.app.outputs.service }}" \
             --query 'services[0].taskDefinition' --output text)
           echo "arn=$arn" >> "$GITHUB_OUTPUT"
           echo "Currently running: $arn"
@@ -168,7 +207,7 @@ jobs:
       - name: Fetch the task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition "${{ inputs.task-family }}" \
+            --task-definition "${{ steps.app.outputs.task-family }}" \
             --query taskDefinition > task-definition.json
 
       - name: Point it at the new image
@@ -176,7 +215,7 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
-          container-name: ${{ inputs.container-name != '' && inputs.container-name || inputs.project }}
+          container-name: ${{ steps.app.outputs.app }}
           image: ${{ steps.image.outputs.uri }}
 
       - name: Deploy and wait for it to settle
@@ -184,7 +223,7 @@ jobs:
         with:
           task-definition: ${{ steps.render.outputs.task-definition }}
           cluster: ${{ inputs.cluster }}
-          service: ${{ inputs.service }}
+          service: ${{ steps.app.outputs.service }}
           wait-for-service-stability: true
           wait-for-minutes: ${{ inputs.wait-minutes }}
 
@@ -210,23 +249,23 @@ jobs:
         if: failure() && steps.previous.outputs.arn != ''
         run: |
           set -euo pipefail
-          echo "::warning::Rolling ${{ inputs.service }} back to ${{ steps.previous.outputs.arn }}"
+          echo "::warning::Rolling ${{ steps.app.outputs.service }} back to ${{ steps.previous.outputs.arn }}"
           aws ecs update-service \
             --cluster "${{ inputs.cluster }}" \
-            --service "${{ inputs.service }}" \
+            --service "${{ steps.app.outputs.service }}" \
             --task-definition "${{ steps.previous.outputs.arn }}" >/dev/null
           aws ecs wait services-stable \
             --cluster "${{ inputs.cluster }}" \
-            --services "${{ inputs.service }}"
+            --services "${{ steps.app.outputs.service }}"
           echo "Rolled back."
 
       - name: Say what is running
         run: |
-          echo "### ${{ inputs.project }} deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ${{ steps.app.outputs.app }} deployed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| image | \`${{ steps.image.outputs.uri }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| cluster | ${{ inputs.cluster }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| service | ${{ inputs.service }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| service | ${{ steps.app.outputs.service }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"

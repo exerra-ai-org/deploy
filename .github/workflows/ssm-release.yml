@@ -31,10 +31,6 @@ name: Release over SSM
 on:
   workflow_call:
     inputs:
-      project:
-        description: Project name. Names the tarball and the release directories.
-        required: true
-        type: string
       artifact-name:
         description: Actions artefact to download, produced by the calling workflow's build job.
         required: true
@@ -67,14 +63,15 @@ on:
         description: S3 bucket the instance pulls the release from.
         required: true
         type: string
-      instance-id:
+      deploy-group:
         description: >-
-          Target instance. SSM addresses it by id, so it needs no public
-          address. An input rather than a secret deliberately: it is not
-          sensitive, and a masked wrong value is invisible -- the IAM refusal
-          renders as "managed-instance/***" and reads like a correct ARN.
-        required: true
+          Value of the DeployGroup tag on the instances this platform manages.
+          Targeting is by tag rather than by instance id so that a caller
+          cannot name someone else's machine: the App tag comes from the
+          registry, not from the caller.
+        required: false
         type: string
+        default: exerra
       environment-file:
         description: >-
           Read by the migration, as the systemd unit reads it. SSM runs as root
@@ -113,12 +110,12 @@ on:
         required: true
 
 concurrency:
-  group: deploy-${{ inputs.project }}
+  group: deploy-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: ${{ inputs.project }} to ${{ inputs.service }}
+    name: ${{ github.repository }} to ${{ inputs.service }}
     runs-on: ubuntu-latest
 
     permissions:
@@ -138,10 +135,51 @@ jobs:
             exit 1
           fi
 
+      # ---- who is calling, and what may they touch -------------------------
+      #
+      # The app is derived from the calling repository, never taken as an
+      # input. That is the whole separation: a repository can only ever write
+      # to its own S3 prefix and send commands to its own instances, whatever
+      # it passes in.
+      #
+      # Taking `app` as an input would make the prefixes housekeeping rather
+      # than a boundary -- any repository could call this workflow with another
+      # app's name and deploy over it. The registry below is the boundary, and
+      # it lives in this file, in a repository whose main branch requires a
+      # review, so adding an app is a reviewed change rather than a workflow
+      # input.
+      #
+      # A repository not listed here cannot deploy at all, which is the correct
+      # default for a role trusted by an entire organisation.
+      - name: Resolve the calling repository to an app
+        id: app
+        run: |
+          set -euo pipefail
+          cat > /tmp/apps.json <<'REGISTRY'
+          {
+            "exerra-ai-org/dialer":     "dialer",
+            "exerra-ai-org/ACRM":       "acrm",
+            "exerra-ai-org/franchiseOS":"franchiseos",
+            "exerra-ai-org/linkedout":  "linkedout",
+            "exerra-ai-org/rusrus":     "rusrus"
+          }
+          REGISTRY
+
+          app=$(jq -r --arg r "${{ github.repository }}" '.[$r] // empty' /tmp/apps.json)
+
+          if [ -z "$app" ]; then
+            echo "::error::${{ github.repository }} is not a registered app."
+            echo "::error::Add it to the registry in exerra-ai-org/deploy and get the change reviewed."
+            exit 1
+          fi
+
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "Calling repository ${{ github.repository }} resolves to app '$app'"
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact-name }}
-          path: rel/${{ inputs.project }}
+          path: rel/${{ steps.app.outputs.app }}
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -155,17 +193,17 @@ jobs:
       - name: Pack and upload
         run: |
           set -euo pipefail
-          find "rel/${{ inputs.project }}/bin" -type f -exec chmod +x {} + 2>/dev/null || true
-          find "rel/${{ inputs.project }}" -path '*/erts-*/bin/*' -type f -exec chmod +x {} + 2>/dev/null || true
+          find "rel/${{ steps.app.outputs.app }}/bin" -type f -exec chmod +x {} + 2>/dev/null || true
+          find "rel/${{ steps.app.outputs.app }}" -path '*/erts-*/bin/*' -type f -exec chmod +x {} + 2>/dev/null || true
           # releases/<vsn>/elixir and iex too. bin/<app> execs elixir, so
           # without this the release unpacks and then fails with
           #   exec: .../releases/0.1.0/elixir: Permission denied
           # which names the script rather than its mode.
-          find "rel/${{ inputs.project }}" -regextype posix-extended \
+          find "rel/${{ steps.app.outputs.app }}" -regextype posix-extended \
             -regex '.*/releases/[^/]+/(elixir|iex)' -type f -exec chmod +x {} + 2>/dev/null || true
-          tar czf "${{ inputs.project }}-${{ github.sha }}.tar.gz" -C rel "${{ inputs.project }}"
-          aws s3 cp "${{ inputs.project }}-${{ github.sha }}.tar.gz" \
-            "s3://${{ inputs.artifact-bucket }}/releases/"
+          tar czf "${{ steps.app.outputs.app }}-${{ github.sha }}.tar.gz" -C rel "${{ steps.app.outputs.app }}"
+          aws s3 cp "${{ steps.app.outputs.app }}-${{ github.sha }}.tar.gz" \
+            "s3://${{ inputs.artifact-bucket }}/${{ steps.app.outputs.app }}/releases/"
 
       - name: Deploy over SSM
         id: ssm
@@ -203,7 +241,7 @@ jobs:
           PREV="$(readlink -f "$ROOT/current" || true)"
           echo "previous release: ${PREV:-none}"
 
-          aws s3 cp "s3://$BUCKET/releases/$PROJECT-$SHA.tar.gz" /tmp/
+          aws s3 cp "s3://$BUCKET/$PROJECT/releases/$PROJECT-$SHA.tar.gz" /tmp/
           rm -rf "$ROOT/releases/$SHA"
           mkdir -p "$ROOT/releases/$SHA"
           tar xzf "/tmp/$PROJECT-$SHA.tar.gz" -C "$ROOT/releases/$SHA" --strip-components=1
@@ -257,7 +295,7 @@ jobs:
           sed -i \
             -e "s|__SHA__|${{ github.sha }}|g" \
             -e "s|__ROOT__|${{ inputs.install-root }}|g" \
-            -e "s|__PROJECT__|${{ inputs.project }}|g" \
+            -e "s|__PROJECT__|${{ steps.app.outputs.app }}|g" \
             -e "s|__SERVICE__|${{ inputs.service }}|g" \
             -e "s|__BUCKET__|${{ inputs.artifact-bucket }}|g" \
             -e "s|__HEALTH__|${{ inputs.health-url }}|g" \
@@ -268,46 +306,78 @@ jobs:
             -e "s|__SETTLE__|${{ inputs.settle-seconds }}|g" \
             /tmp/remote.sh
 
+          # Targeted by tag, not by instance id. The App tag comes from the
+          # registry rather than from the caller, so a repository cannot send a
+          # command to another app's machine even if it knows the id. It also
+          # means adding a second instance needs no change here -- tag it and it
+          # is in.
+          APP="${{ steps.app.outputs.app }}"
           command_id=$(aws ssm send-command \
-            --instance-ids "${{ inputs.instance-id }}" \
+            --targets "Key=tag:DeployGroup,Values=${{ inputs.deploy-group }}" \
+                      "Key=tag:App,Values=$APP" \
             --document-name AWS-RunShellScript \
-            --comment "deploy ${{ inputs.project }} ${{ github.sha }} by ${{ github.actor }}" \
+            --comment "deploy $APP ${{ github.sha }} by ${{ github.actor }}" \
             --parameters commands="$(jq -Rs '[.]' < /tmp/remote.sh)" \
             --query Command.CommandId --output text)
 
           echo "ssm command $command_id"
           echo "id=$command_id" >> "$GITHUB_OUTPUT"
 
-          # `wait command-executed` returns non-zero when the command failed, and
-          # that is a legitimate outcome we want to report properly rather than
-          # let kill the step here.
-          aws ssm wait command-executed \
-            --command-id "$command_id" \
-            --instance-id "${{ inputs.instance-id }}" || true
+          # SendCommand succeeds when the tags match nothing at all -- it simply
+          # runs on zero instances and reports Success. That is the failure most
+          # likely to be mistaken for a deploy, so it is checked explicitly and
+          # loudly rather than left to look like one.
+          instances=""
+          for _ in $(seq 1 10); do
+            instances=$(aws ssm list-command-invocations \
+              --command-id "$command_id" \
+              --query 'CommandInvocations[].InstanceId' --output text)
+            [ -n "$instances" ] && break
+            sleep 3
+          done
 
-          aws ssm get-command-invocation \
-            --command-id "$command_id" \
-            --instance-id "${{ inputs.instance-id }}" \
-            --query StandardOutputContent --output text
+          if [ -z "$instances" ]; then
+            echo "::error::No instance matched DeployGroup=${{ inputs.deploy-group }} App=$APP."
+            echo "::error::Tag the instance with both, or it cannot be deployed to."
+            exit 1
+          fi
 
-          aws ssm get-command-invocation \
-            --command-id "$command_id" \
-            --instance-id "${{ inputs.instance-id }}" \
-            --query StandardErrorContent --output text >&2
+          echo "targeted: $instances"
 
-          status=$(aws ssm get-command-invocation \
-            --command-id "$command_id" \
-            --instance-id "${{ inputs.instance-id }}" \
-            --query Status --output text)
+          failed=0
+          for instance in $instances; do
+            echo "── $instance ─────────────────────────────────────────"
 
-          if [ "$status" != "Success" ]; then
-            echo "::error::deploy failed: $status (the instance has rolled itself back)"
+            # `wait command-executed` exits non-zero when the command failed,
+            # which is a legitimate outcome to report rather than let kill the
+            # step here.
+            aws ssm wait command-executed \
+              --command-id "$command_id" --instance-id "$instance" || true
+
+            aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$instance" \
+              --query StandardOutputContent --output text
+
+            aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$instance" \
+              --query StandardErrorContent --output text >&2
+
+            status=$(aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$instance" \
+              --query Status --output text)
+
+            echo "$instance: $status"
+            [ "$status" = "Success" ] || failed=1
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::deploy failed (each instance has rolled itself back)"
             exit 1
           fi
 
       - name: Say what is running
         run: |
-          echo "### ${{ inputs.project }} deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ${{ steps.app.outputs.app }} deployed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
