@@ -154,6 +154,16 @@ jobs:
           # deploy scripts go to die: a quote in a health URL or a migrate
           # command silently truncates the script.
           cat > /tmp/remote.sh <<'REMOTE'
+          #!/bin/bash
+          # The shebang is load-bearing. SSM's AWS-RunShellScript writes these
+          # commands to a file and runs it with /bin/sh, which on Ubuntu is
+          # dash. dash has no `pipefail`, so without this the script dies on its
+          # first line with
+          #
+          #   _script.sh: 1: set: Illegal option -o pipefail
+          #
+          # having done nothing -- and SSM reports it as a plain "Failed", which
+          # reads like the deploy went wrong rather than never started.
           set -euo pipefail
           SHA="__SHA__"
           ROOT="__ROOT__"
