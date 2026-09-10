@@ -63,6 +63,26 @@ on:
         required: false
         type: string
         default: ''
+      artifact-bucket:
+        description: S3 bucket the instance pulls the release from.
+        required: true
+        type: string
+      instance-id:
+        description: >-
+          Target instance. SSM addresses it by id, so it needs no public
+          address. An input rather than a secret deliberately: it is not
+          sensitive, and a masked wrong value is invisible -- the IAM refusal
+          renders as "managed-instance/***" and reads like a correct ARN.
+        required: true
+        type: string
+      environment-file:
+        description: >-
+          Read by the migration, as the systemd unit reads it. SSM runs as root
+          with a bare environment, so without this the release starts with none
+          of its configuration and refuses to boot.
+        required: false
+        type: string
+        default: ''
       aws-region:
         required: false
         type: string
@@ -87,12 +107,9 @@ on:
         default: true
     secrets:
       AWS_DEPLOY_ROLE_ARN:
-        required: true
-      ARTIFACT_BUCKET:
-        description: S3 bucket the instance pulls the release from.
-        required: true
-      INSTANCE_ID:
-        description: Target instance. SSM addresses it by id, so it needs no public address.
+        description: >-
+          Role the runner assumes through OIDC. The only secret here: it names
+          an account. No AWS key is stored anywhere.
         required: true
 
 concurrency:
@@ -148,7 +165,7 @@ jobs:
             -regex '.*/releases/[^/]+/(elixir|iex)' -type f -exec chmod +x {} + 2>/dev/null || true
           tar czf "${{ inputs.project }}-${{ github.sha }}.tar.gz" -C rel "${{ inputs.project }}"
           aws s3 cp "${{ inputs.project }}-${{ github.sha }}.tar.gz" \
-            "s3://${{ secrets.ARTIFACT_BUCKET }}/releases/"
+            "s3://${{ inputs.artifact-bucket }}/releases/"
 
       - name: Deploy over SSM
         id: ssm
@@ -179,6 +196,7 @@ jobs:
           HEALTH="__HEALTH__"
           RUN_USER="__RUN_USER__"
           MIGRATE="__MIGRATE__"
+          ENVFILE="__ENVFILE__"
           KEEP="__KEEP__"
           SETTLE="__SETTLE__"
 
@@ -199,7 +217,20 @@ jobs:
 
           if [ -n "$MIGRATE" ]; then
             echo "migrating"
-            ( cd "$ROOT/releases/$SHA" && eval "$MIGRATE" )
+            if [ -n "$ENVFILE" ]; then
+              # systemd-run with the unit's own EnvironmentFile rather than
+              # exporting variables by hand: pass them by hand and one of them
+              # eventually goes missing, and a release that cannot see its
+              # database reports "Migrations already up" against an empty one.
+              systemd-run \
+                ${RUN_USER:+--uid="$RUN_USER" --gid="$RUN_USER"} \
+                --property=EnvironmentFile="$ENVFILE" \
+                --property=WorkingDirectory="$ROOT/releases/$SHA" \
+                --wait --collect --pipe --quiet \
+                /bin/sh -c "$MIGRATE"
+            else
+              ( cd "$ROOT/releases/$SHA" && eval "$MIGRATE" )
+            fi
           fi
 
           ln -sfn "$ROOT/releases/$SHA" "$ROOT/current"
@@ -228,16 +259,17 @@ jobs:
             -e "s|__ROOT__|${{ inputs.install-root }}|g" \
             -e "s|__PROJECT__|${{ inputs.project }}|g" \
             -e "s|__SERVICE__|${{ inputs.service }}|g" \
-            -e "s|__BUCKET__|${{ secrets.ARTIFACT_BUCKET }}|g" \
+            -e "s|__BUCKET__|${{ inputs.artifact-bucket }}|g" \
             -e "s|__HEALTH__|${{ inputs.health-url }}|g" \
             -e "s|__RUN_USER__|${{ inputs.run-user }}|g" \
             -e "s|__MIGRATE__|${{ inputs.migrate-command }}|g" \
+            -e "s|__ENVFILE__|${{ inputs.environment-file }}|g" \
             -e "s|__KEEP__|${{ inputs.keep-releases }}|g" \
             -e "s|__SETTLE__|${{ inputs.settle-seconds }}|g" \
             /tmp/remote.sh
 
           command_id=$(aws ssm send-command \
-            --instance-ids "${{ secrets.INSTANCE_ID }}" \
+            --instance-ids "${{ inputs.instance-id }}" \
             --document-name AWS-RunShellScript \
             --comment "deploy ${{ inputs.project }} ${{ github.sha }} by ${{ github.actor }}" \
             --parameters commands="$(jq -Rs '[.]' < /tmp/remote.sh)" \
@@ -251,21 +283,21 @@ jobs:
           # let kill the step here.
           aws ssm wait command-executed \
             --command-id "$command_id" \
-            --instance-id "${{ secrets.INSTANCE_ID }}" || true
+            --instance-id "${{ inputs.instance-id }}" || true
 
           aws ssm get-command-invocation \
             --command-id "$command_id" \
-            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --instance-id "${{ inputs.instance-id }}" \
             --query StandardOutputContent --output text
 
           aws ssm get-command-invocation \
             --command-id "$command_id" \
-            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --instance-id "${{ inputs.instance-id }}" \
             --query StandardErrorContent --output text >&2
 
           status=$(aws ssm get-command-invocation \
             --command-id "$command_id" \
-            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --instance-id "${{ inputs.instance-id }}" \
             --query Status --output text)
 
           if [ "$status" != "Success" ]; then
