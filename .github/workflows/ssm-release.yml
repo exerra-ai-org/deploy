@@ -342,13 +342,22 @@ jobs:
           # runs on zero instances and reports Success. That is the failure most
           # likely to be mistaken for a deploy, so it is checked explicitly and
           # loudly rather than left to look like one.
+          # 20 x 5s, not 10 x 3s. SSM's tag index lags EC2 by around half a
+          # minute: measured on a freshly tagged instance, three SendCommands
+          # over 30 seconds matched nothing and the fourth matched. The instance
+          # was Online in SSM the whole time and carried both tags immediately.
+          #
+          # That lag is indistinguishable from a wrong tag, because SendCommand
+          # succeeds either way and runs on nothing. A window that only just
+          # covers the delay turns "deployed a minute after tagging" into a
+          # clean-looking failure with the wrong cause.
           instances=""
-          for _ in $(seq 1 10); do
+          for _ in $(seq 1 20); do
             instances=$(aws ssm list-command-invocations \
               --command-id "$command_id" \
               --query 'CommandInvocations[].InstanceId' --output text)
             [ -n "$instances" ] && break
-            sleep 3
+            sleep 5
           done
 
           if [ -z "$instances" ]; then
