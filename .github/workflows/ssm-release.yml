@@ -1,0 +1,268 @@
+# Ship a build artefact to an EC2 instance over SSM.
+#
+# The other lane. Use this for something that is not in a container and is not
+# going to be: the dialer runs FreeSWITCH alongside the application, holds long
+# lived SIP registrations and RTP sockets, and is pinned to one box on purpose.
+#
+#   jobs:
+#     deploy:
+#       uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@v1
+#       with:
+#         project: dialer
+#         artifact-name: release-${{ github.sha }}
+#         install-root: /opt/dialer
+#         service: dialer
+#         health-url: http://localhost:4000/health
+#         aws-region: us-east-1
+#         require-confirm: true
+#         confirm: ${{ inputs.confirm }}
+#       secrets: inherit
+#
+# The runner never opens an SSH session. It assumes a role through OIDC, puts a
+# tarball in S3, and asks SSM to run a script on the instance. Port 22 stays
+# closed to everything but your own address, and there is no key to leak.
+#
+# Expects the calling workflow to have already uploaded the build as an actions
+# artefact. Build once, deploy that exact artefact: rebuilding at deploy time
+# ships something nobody tested.
+
+name: Release over SSM
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name. Names the tarball and the release directories.
+        required: true
+        type: string
+      artifact-name:
+        description: Actions artefact to download, produced by the calling workflow's build job.
+        required: true
+        type: string
+      install-root:
+        description: Directory on the instance holding `releases/` and the `current` symlink.
+        required: true
+        type: string
+      service:
+        description: systemd unit to restart.
+        required: true
+        type: string
+      health-url:
+        description: Checked on the instance after the restart. Failure rolls the symlink back.
+        required: true
+        type: string
+      run-user:
+        description: Owner of the unpacked release on the instance.
+        required: false
+        type: string
+        default: ''
+      migrate-command:
+        description: >-
+          Optional command run from inside the new release directory before the
+          symlink moves, relative to it. Empty means no migration step.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        required: false
+        type: string
+        default: eu-west-2
+      keep-releases:
+        description: How many old releases to leave on disk for rollback.
+        required: false
+        type: number
+        default: 5
+      settle-seconds:
+        description: Seconds to wait after the restart before the first health check.
+        required: false
+        type: number
+        default: 8
+      confirm:
+        required: false
+        type: string
+        default: ''
+      require-confirm:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        required: true
+      ARTIFACT_BUCKET:
+        description: S3 bucket the instance pulls the release from.
+        required: true
+      INSTANCE_ID:
+        description: Target instance. SSM addresses it by id, so it needs no public address.
+        required: true
+
+concurrency:
+  group: deploy-${{ inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.project }} to ${{ inputs.service }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # Deploying here is not free: on the dialer it logs out every agent and
+      # stops every campaign, and nothing resumes on boot. The person most
+      # likely to press this without knowing that is the one who has not read
+      # the runbook, so the guard is an input rather than a note.
+      - name: Refuse unless somebody meant it
+        if: inputs.require-confirm
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::Type DEPLOY to confirm. This restarts ${{ inputs.service }}."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: rel/${{ inputs.project }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # Actions artefacts do not preserve the executable bit, so anything that
+      # has to run is made executable again before it is packed. Without this
+      # the release unpacks onto the instance and the unit fails to start with
+      # "Permission denied" against a file that is plainly there.
+      - name: Pack and upload
+        run: |
+          set -euo pipefail
+          find "rel/${{ inputs.project }}/bin" -type f -exec chmod +x {} + 2>/dev/null || true
+          find "rel/${{ inputs.project }}" -path '*/erts-*/bin/*' -type f -exec chmod +x {} + 2>/dev/null || true
+          tar czf "${{ inputs.project }}-${{ github.sha }}.tar.gz" -C rel "${{ inputs.project }}"
+          aws s3 cp "${{ inputs.project }}-${{ github.sha }}.tar.gz" \
+            "s3://${{ secrets.ARTIFACT_BUCKET }}/releases/"
+
+      - name: Deploy over SSM
+        id: ssm
+        run: |
+          set -euo pipefail
+
+          # Written to a file and passed as one parameter rather than as a JSON
+          # array of lines. Quoting a shell script through --parameters is where
+          # deploy scripts go to die: a quote in a health URL or a migrate
+          # command silently truncates the script.
+          cat > /tmp/remote.sh <<'REMOTE'
+          set -euo pipefail
+          SHA="__SHA__"
+          ROOT="__ROOT__"
+          PROJECT="__PROJECT__"
+          SERVICE="__SERVICE__"
+          BUCKET="__BUCKET__"
+          HEALTH="__HEALTH__"
+          RUN_USER="__RUN_USER__"
+          MIGRATE="__MIGRATE__"
+          KEEP="__KEEP__"
+          SETTLE="__SETTLE__"
+
+          PREV="$(readlink -f "$ROOT/current" || true)"
+          echo "previous release: ${PREV:-none}"
+
+          aws s3 cp "s3://$BUCKET/releases/$PROJECT-$SHA.tar.gz" /tmp/
+          rm -rf "$ROOT/releases/$SHA"
+          mkdir -p "$ROOT/releases/$SHA"
+          tar xzf "/tmp/$PROJECT-$SHA.tar.gz" -C "$ROOT/releases/$SHA" --strip-components=1
+          # An if rather than a bare . That form is safe under
+          # set -e -- verified, bash does not exit when the failing command is a
+          # non-final part of an && list -- but every reader has to stop and
+          # check that, which is a poor trade for one saved line.
+          if [ -n "$RUN_USER" ]; then
+            chown -R "$RUN_USER:$RUN_USER" "$ROOT/releases/$SHA"
+          fi
+
+          if [ -n "$MIGRATE" ]; then
+            echo "migrating"
+            ( cd "$ROOT/releases/$SHA" && eval "$MIGRATE" )
+          fi
+
+          ln -sfn "$ROOT/releases/$SHA" "$ROOT/current"
+          systemctl restart "$SERVICE"
+          sleep "$SETTLE"
+
+          if ! curl -fsS --max-time 10 "$HEALTH"; then
+            echo "health check failed; rolling back"
+            if [ -n "$PREV" ]; then
+              ln -sfn "$PREV" "$ROOT/current"
+              systemctl restart "$SERVICE"
+              sleep "$SETTLE"
+              curl -fsS --max-time 10 "$HEALTH" && echo "rolled back and healthy" || echo "ROLLED BACK AND STILL UNHEALTHY"
+            else
+              echo "no previous release to roll back to"
+            fi
+            exit 1
+          fi
+
+          echo "healthy"
+          ls -1dt "$ROOT/releases/"* | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+          REMOTE
+
+          sed -i \
+            -e "s|__SHA__|${{ github.sha }}|g" \
+            -e "s|__ROOT__|${{ inputs.install-root }}|g" \
+            -e "s|__PROJECT__|${{ inputs.project }}|g" \
+            -e "s|__SERVICE__|${{ inputs.service }}|g" \
+            -e "s|__BUCKET__|${{ secrets.ARTIFACT_BUCKET }}|g" \
+            -e "s|__HEALTH__|${{ inputs.health-url }}|g" \
+            -e "s|__RUN_USER__|${{ inputs.run-user }}|g" \
+            -e "s|__MIGRATE__|${{ inputs.migrate-command }}|g" \
+            -e "s|__KEEP__|${{ inputs.keep-releases }}|g" \
+            -e "s|__SETTLE__|${{ inputs.settle-seconds }}|g" \
+            /tmp/remote.sh
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ secrets.INSTANCE_ID }}" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${{ inputs.project }} ${{ github.sha }} by ${{ github.actor }}" \
+            --parameters commands="$(jq -Rs '[.]' < /tmp/remote.sh)" \
+            --query Command.CommandId --output text)
+
+          echo "ssm command $command_id"
+          echo "id=$command_id" >> "$GITHUB_OUTPUT"
+
+          # `wait command-executed` returns non-zero when the command failed, and
+          # that is a legitimate outcome we want to report properly rather than
+          # let kill the step here.
+          aws ssm wait command-executed \
+            --command-id "$command_id" \
+            --instance-id "${{ secrets.INSTANCE_ID }}" || true
+
+          aws ssm get-command-invocation \
+            --command-id "$command_id" \
+            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --query StandardOutputContent --output text
+
+          aws ssm get-command-invocation \
+            --command-id "$command_id" \
+            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --query StandardErrorContent --output text >&2
+
+          status=$(aws ssm get-command-invocation \
+            --command-id "$command_id" \
+            --instance-id "${{ secrets.INSTANCE_ID }}" \
+            --query Status --output text)
+
+          if [ "$status" != "Success" ]; then
+            echo "::error::deploy failed: $status (the instance has rolled itself back)"
+            exit 1
+          fi
+
+      - name: Say what is running
+        run: |
+          echo "### ${{ inputs.project }} deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| unit | ${{ inputs.service }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"

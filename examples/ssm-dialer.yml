@@ -1,0 +1,46 @@
+# The dialer. Two jobs, because the build is the project's own business and the
+# deploy is the platform's.
+#
+# workflow_dispatch, not push. A deploy here restarts the release, which logs
+# out every agent and stops every campaign, and nothing resumes on boot. A
+# teammate merging at three in the afternoon would end the floor's shift without
+# knowing they had done it.
+
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm. This ends every call in progress.'
+        required: true
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix develop --command mix deps.get --only prod
+      - run: nix develop --command env MIX_ENV=prod mix release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: _build/prod/rel/dialer
+
+  deploy:
+    needs: build
+    uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@v1
+    with:
+      project: dialer
+      artifact-name: release-${{ github.sha }}
+      install-root: /opt/dialer
+      service: dialer
+      run-user: dialer
+      health-url: http://localhost:4000/health
+      migrate-command: ./bin/dialer eval "Dialer.Release.migrate()"
+      aws-region: us-east-1
+      require-confirm: true
+      confirm: ${{ inputs.confirm }}
+    secrets: inherit

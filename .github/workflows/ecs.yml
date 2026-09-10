@@ -1,0 +1,232 @@
+# Build an image and put it on ECS Fargate.
+#
+# Called by a project's own .github/workflows/cd.yml. That file should be about
+# ten lines; everything that is the same for every project is here, once.
+#
+#   jobs:
+#     deploy:
+#       uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@v1
+#       with:
+#         project: acrm
+#         cluster: agency-prod
+#         service: acrm-service
+#         ecr-repository: acrm
+#         task-family: acrm
+#       secrets: inherit
+#
+# What this does that copying deploy-ecs.yml into each repo did not:
+#
+#   1. It registers a new task definition revision pointing at the image it
+#      just built. The previous workflow pushed <repo>:<sha> to ECR and then
+#      called `update-service --force-new-deployment`, which re-runs whatever
+#      revision the service already had. The Terraform that creates a service
+#      sets `image = "nginx:alpine"` as a placeholder and then
+#      `ignore_changes = [task_definition]`, so nothing else was ever going to
+#      change it. Deploys pushed an image that nothing ran.
+#   2. It waits for the deployment to stabilise instead of returning the moment
+#      the API call is accepted. A task that crash-loops used to report a green
+#      deploy.
+#   3. It rolls back to the previous task definition if the deployment fails or
+#      the health check does not answer.
+
+name: Deploy to ECS
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Project name. Used for logging and as the default container name.
+        required: true
+        type: string
+      cluster:
+        description: ECS cluster, e.g. agency-prod.
+        required: true
+        type: string
+      service:
+        description: ECS service name.
+        required: true
+        type: string
+      ecr-repository:
+        description: ECR repository name, without the registry host.
+        required: true
+        type: string
+      task-family:
+        description: Task definition family to base the new revision on.
+        required: true
+        type: string
+      container-name:
+        description: Container inside the task definition to point at the new image. Defaults to the project name.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        required: false
+        type: string
+        default: eu-west-2
+      docker-context:
+        description: Build context. Set this for a monorepo.
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+      health-url:
+        description: >-
+          Optional URL to check after the service stabilises. A stable service is
+          one whose tasks stayed running; it is not a service that can reach its
+          database. If this is set and does not answer, the deploy rolls back.
+        required: false
+        type: string
+        default: ''
+      wait-minutes:
+        description: How long to wait for the service to stabilise before calling it failed.
+        required: false
+        type: number
+        default: 10
+      confirm:
+        description: Pass the workflow_dispatch input here when require-confirm is true.
+        required: false
+        type: string
+        default: ''
+      require-confirm:
+        description: >-
+          Refuse to deploy unless `confirm` is the literal string DEPLOY. For
+          projects where a restart has a cost somebody should have to
+          acknowledge.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        description: Role the runner assumes through OIDC. No AWS key is stored anywhere.
+        required: true
+
+concurrency:
+  # One deploy per project at a time. Not cancel-in-progress: interrupting a
+  # deploy half way leaves the service on a revision nobody chose.
+  group: deploy-${{ inputs.project }}-${{ inputs.cluster }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: ${{ inputs.project }} to ${{ inputs.cluster }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Refuse unless somebody meant it
+        if: inputs.require-confirm
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::Type DEPLOY to confirm. This restarts ${{ inputs.project }}."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged with the commit, never with a moving tag. A moving tag makes
+      # "which code is running" unanswerable, and makes rollback a guess.
+      - name: Build and push
+        id: image
+        env:
+          URI: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            -f "${{ inputs.docker-context }}/${{ inputs.dockerfile }}" \
+            -t "$URI" \
+            "${{ inputs.docker-context }}"
+          docker push "$URI"
+          echo "uri=$URI" >> "$GITHUB_OUTPUT"
+
+      # Read before writing. This is what the service goes back to if the new
+      # revision does not come up.
+      - name: Note what is running now
+        id: previous
+        run: |
+          set -euo pipefail
+          arn=$(aws ecs describe-services \
+            --cluster "${{ inputs.cluster }}" \
+            --services "${{ inputs.service }}" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+          echo "Currently running: $arn"
+
+      - name: Fetch the task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ inputs.task-family }}" \
+            --query taskDefinition > task-definition.json
+
+      - name: Point it at the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ inputs.container-name != '' && inputs.container-name || inputs.project }}
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Deploy and wait for it to settle
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ inputs.cluster }}
+          service: ${{ inputs.service }}
+          wait-for-service-stability: true
+          wait-for-minutes: ${{ inputs.wait-minutes }}
+
+      # Stable means the tasks stayed up. It does not mean the application can
+      # reach its database, which is the failure worth catching.
+      - name: Health check
+        if: inputs.health-url != ''
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 10); do
+            if curl -fsS --max-time 10 "${{ inputs.health-url }}" > /tmp/health.json; then
+              echo "healthy:"; cat /tmp/health.json; exit 0
+            fi
+            echo "attempt $i: no answer yet"; sleep 6
+          done
+          echo "::error::${{ inputs.health-url }} did not answer after 10 attempts"
+          exit 1
+
+      # Runs when the deployment failed to stabilise or the health check did not
+      # answer. Puts the previous revision back and waits for it, so the job
+      # does not go red while the service is still mid-flight.
+      - name: Roll back
+        if: failure() && steps.previous.outputs.arn != ''
+        run: |
+          set -euo pipefail
+          echo "::warning::Rolling ${{ inputs.service }} back to ${{ steps.previous.outputs.arn }}"
+          aws ecs update-service \
+            --cluster "${{ inputs.cluster }}" \
+            --service "${{ inputs.service }}" \
+            --task-definition "${{ steps.previous.outputs.arn }}" >/dev/null
+          aws ecs wait services-stable \
+            --cluster "${{ inputs.cluster }}" \
+            --services "${{ inputs.service }}"
+          echo "Rolled back."
+
+      - name: Say what is running
+        run: |
+          echo "### ${{ inputs.project }} deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| image | \`${{ steps.image.outputs.uri }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| cluster | ${{ inputs.cluster }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| service | ${{ inputs.service }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"

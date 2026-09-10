@@ -1,0 +1,27 @@
+# For a project where a deploy costs something a person should acknowledge:
+# it interrupts work in progress, or it runs a migration that is awkward to
+# undo. A human presses the button and types DEPLOY.
+
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm'
+        required: true
+        default: ''
+
+jobs:
+  deploy:
+    uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@v1
+    with:
+      project: franchiseos
+      cluster: agency-prod
+      service: franchiseos-service
+      ecr-repository: franchiseos
+      task-family: franchiseos
+      health-url: https://api.franchiseos.example.com/health
+      require-confirm: true
+      confirm: ${{ inputs.confirm }}
+    secrets: inherit

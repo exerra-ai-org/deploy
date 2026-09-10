@@ -1,0 +1,35 @@
+# The ordinary case: merging to main deploys to prod, merging to develop
+# deploys to dev. Copy this to .github/workflows/cd.yml in the project.
+#
+# The branch decides the environment because that is what the OIDC trust policy
+# keys on, so the branch and the account cannot drift apart.
+
+name: CD
+
+on:
+  push:
+    branches: [main, develop]
+
+jobs:
+  prod:
+    if: github.ref == 'refs/heads/main'
+    uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@v1
+    with:
+      project: acrm
+      cluster: agency-prod
+      service: acrm-service
+      ecr-repository: acrm
+      task-family: acrm
+      health-url: https://api.acrm.example.com/health
+    secrets: inherit
+
+  dev:
+    if: github.ref == 'refs/heads/develop'
+    uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@v1
+    with:
+      project: acrm
+      cluster: agency-dev
+      service: acrm-service
+      ecr-repository: acrm
+      task-family: acrm
+    secrets: inherit
