@@ -242,6 +242,26 @@ jobs:
           URI: ${{ steps.ecr.outputs.registry }}/${{ steps.app.outputs.ecr-repository }}:${{ github.sha }}
         run: |
           set -euo pipefail
+          # Already built this commit? Then there is nothing to do.
+          #
+          # Tags are immutable, deliberately: a tag that can move makes "which
+          # code is running" unanswerable and rollback a guess. The cost is that
+          # re-running a deploy for the same commit cannot push the same tag,
+          # and the push fails with ImageTagAlreadyExists -- which looks like a
+          # broken pipeline rather than a pipeline being asked to do something
+          # it already did.
+          #
+          # Re-deploying an unchanged commit is a legitimate thing to want: a
+          # rollback, a task that died, a service that needs pushing again. So
+          # the existing image is reused and the deploy carries on.
+          if aws ecr describe-images \
+               --repository-name "${{ steps.app.outputs.ecr-repository }}" \
+               --image-ids imageTag="${{ github.sha }}" >/dev/null 2>&1; then
+            echo "::notice::${{ github.sha }} is already in ECR; reusing it"
+            echo "uri=$URI" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           args=()
           while IFS= read -r line; do
             [ -z "$line" ] && continue
