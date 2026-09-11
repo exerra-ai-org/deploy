@@ -117,6 +117,15 @@ concurrency:
 
 jobs:
   deploy:
+    # The environment is declared here, not by the caller. A job that calls a
+    # reusable workflow accepts only uses/with/secrets/needs/if/permissions/
+    # strategy/concurrency -- `environment` on such a job is rejected outright,
+    # and GitHub reports it as "this run likely failed because of a workflow
+    # file issue" with a zero-second run and no annotation naming the key.
+    #
+    # It has to be here anyway: the environment is half of the OIDC subject, so
+    # it must apply to the job that actually requests the token.
+    environment: ${{ inputs.environment }}
     name: ${{ github.repository }} to ${{ inputs.cluster }}
     runs-on: ubuntu-latest
 

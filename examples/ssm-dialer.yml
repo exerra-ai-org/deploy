@@ -31,7 +31,6 @@ jobs:
 
   deploy:
     needs: build
-    environment: production
     uses: exerra-ai-org/deploy/.github/workflows/ssm-release.yml@main
     with:
       aws-account-id: "294342039646"
