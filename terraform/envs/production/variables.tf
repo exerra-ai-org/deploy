@@ -49,3 +49,15 @@ variable "task_role_arns" {
   type        = list(string)
   default     = []
 }
+
+variable "acrm_secret_arns" {
+  description = "SSM parameter ARNs for ACRM, as { ENV_NAME = arn }. Empty until the parameters exist."
+  type        = map(string)
+  default     = {}
+}
+
+variable "acrm_certificate_arn" {
+  description = "ACM certificate for ACRM's load balancer. Null serves plain HTTP."
+  type        = string
+  default     = null
+}
