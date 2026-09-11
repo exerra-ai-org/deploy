@@ -59,6 +59,27 @@ on:
           repository instead -- see the registry step.
         required: true
         type: string
+      component:
+        description: >-
+          A second service in the same repository, e.g. "frontend". The app
+          becomes <app>-<component>, so ACRM's two services are acrm and
+          acrm-frontend.
+
+          Appended to the app the registry resolved rather than replacing it: a
+          repository still cannot address another project, only its own
+          components.
+        required: false
+        type: string
+        default: ''
+      build-args:
+        description: >-
+          Docker build arguments, one KEY=VALUE per line. For Vite apps these
+          are the configuration: import.meta.env is inlined at build time, so
+          the API URL and anon key are baked into the bundle and changing them
+          means rebuilding, not restarting.
+        required: false
+        type: string
+        default: ''
       ecr-namespace:
         description: Optional prefix on the ECR repository name, e.g. "exerra".
         required: false
@@ -184,6 +205,11 @@ jobs:
           echo "app=$app" >> "$GITHUB_OUTPUT"
           echo "Calling repository ${{ github.repository }} resolves to app '$app'"
 
+          # The registry decides the base; the component only narrows it further.
+          component="${{ inputs.component }}"
+          [ -n "$component" ] && app="${app}-${component}"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
           ns="${{ inputs.ecr-namespace }}"
           echo "ecr-repository=${ns:+$ns/}$app" >> "$GITHUB_OUTPUT"
           echo "service=${app}${{ inputs.service-suffix }}" >> "$GITHUB_OUTPUT"
@@ -210,8 +236,15 @@ jobs:
           URI: ${{ steps.ecr.outputs.registry }}/${{ steps.app.outputs.ecr-repository }}:${{ github.sha }}
         run: |
           set -euo pipefail
+          args=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            args+=(--build-arg "$line")
+          done <<< "${{ inputs.build-args }}"
+
           docker build \
             -f "${{ inputs.docker-context }}/${{ inputs.dockerfile }}" \
+            "${args[@]}" \
             -t "$URI" \
             "${{ inputs.docker-context }}"
           docker push "$URI"
