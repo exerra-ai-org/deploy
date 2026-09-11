@@ -131,9 +131,15 @@ on:
         default: false
 
 concurrency:
-  # One deploy per project at a time. Not cancel-in-progress: interrupting a
-  # deploy half way leaves the service on a revision nobody chose.
-  group: deploy-${{ github.repository }}-${{ inputs.cluster }}
+  # One deploy per *service* at a time, not per repository. Without the
+  # component, a repository with two services puts both jobs in one group: the
+  # first runs, the second queues, and GitHub cancels the queued one the moment
+  # anything else arrives. It shows up as a job cancelled in zero seconds with
+  # no error, which reads like a workflow fault rather than a collision.
+  #
+  # Still not cancel-in-progress: interrupting a deploy half way leaves the
+  # service on a revision nobody chose.
+  group: deploy-${{ github.repository }}-${{ inputs.component }}-${{ inputs.cluster }}
   cancel-in-progress: false
 
 jobs:
