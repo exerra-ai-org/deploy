@@ -65,6 +65,19 @@ locals {
       lane       = "ecs"
       sub_prefix = "repo:exerra-ai-org/Truck-Engine" # old format, see above
     }
+
+    # A second service in the ACRM repository, so the same subject: the trust
+    # policy keys on repository and environment, and both services are deployed
+    # by the same workflow from the same repository.
+    #
+    # A separate role rather than sharing acrm's, because the permissions are
+    # what make the separation real: this one can push to the acrm-frontend ECR
+    # repository and update acrm-frontend-service, and nothing else. Sharing one
+    # role would let a frontend deploy overwrite the API's image.
+    acrm-frontend = {
+      lane       = "ecs"
+      sub_prefix = "repo:exerra-ai-org@226608819/ACRM@1335280218"
+    }
   }
 
   # Branches, not tags. job_workflow_ref carries the ref the caller used, so
