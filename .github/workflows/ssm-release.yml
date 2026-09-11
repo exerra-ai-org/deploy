@@ -231,6 +231,31 @@ jobs:
 
       - name: Deploy over SSM
         id: ssm
+        # As environment variables, not as ${{ }} inside the script.
+        #
+        # A GitHub expression is textual substitution: it is pasted into the
+        # shell source before bash parses it, so a value containing a quote
+        # rewrites the surrounding syntax. The dialer was the first caller to
+        # pass one --
+        #
+        #   migrate-command: ./bin/dialer eval "Dialer.Release.migrate()"
+        #
+        # -- and the step died on the bare parentheses. env: hands the value to
+        # the process instead, where quoting cannot leak.
+        env:
+          IN_SHA: ${{ github.sha }}
+          IN_ACTOR: ${{ github.actor }}
+          IN_APP: ${{ steps.app.outputs.app }}
+          IN_ROOT: ${{ inputs.install-root }}
+          IN_SERVICE: ${{ inputs.service }}
+          IN_BUCKET: ${{ inputs.artifact-bucket }}
+          IN_HEALTH: ${{ inputs.health-url }}
+          IN_RUN_USER: ${{ inputs.run-user }}
+          IN_MIGRATE: ${{ inputs.migrate-command }}
+          IN_ENVFILE: ${{ inputs.environment-file }}
+          IN_KEEP: ${{ inputs.keep-releases }}
+          IN_SETTLE: ${{ inputs.settle-seconds }}
+          IN_GROUP: ${{ inputs.deploy-group }}
         run: |
           set -euo pipefail
 
@@ -238,29 +263,29 @@ jobs:
           # array of lines. Quoting a shell script through --parameters is where
           # deploy scripts go to die: a quote in a health URL or a migrate
           # command silently truncates the script.
-          cat > /tmp/remote.sh <<'REMOTE'
-          #!/bin/bash
-          # The shebang is load-bearing. SSM's AWS-RunShellScript writes these
-          # commands to a file and runs it with /bin/sh, which on Ubuntu is
-          # dash. dash has no `pipefail`, so without this the script dies on its
-          # first line with
-          #
-          #   _script.sh: 1: set: Illegal option -o pipefail
-          #
-          # having done nothing -- and SSM reports it as a plain "Failed", which
-          # reads like the deploy went wrong rather than never started.
-          set -euo pipefail
-          SHA="__SHA__"
-          ROOT="__ROOT__"
-          PROJECT="__PROJECT__"
-          SERVICE="__SERVICE__"
-          BUCKET="__BUCKET__"
-          HEALTH="__HEALTH__"
-          RUN_USER="__RUN_USER__"
-          MIGRATE="__MIGRATE__"
-          ENVFILE="__ENVFILE__"
-          KEEP="__KEEP__"
-          SETTLE="__SETTLE__"
+          # printf %q quotes each value for the shell whatever is in it. The body
+          # below stays a *quoted* heredoc, so nothing in it is expanded or
+          # executed as it is written -- an unquoted one runs anything in
+          # backticks, including inside comments.
+          {
+            printf '#!/bin/bash\n'
+            printf 'set -euo pipefail\n'
+            printf 'SHA=%q\n'      "$IN_SHA"
+            printf 'ROOT=%q\n'     "$IN_ROOT"
+            printf 'PROJECT=%q\n'  "$IN_APP"
+            printf 'SERVICE=%q\n'  "$IN_SERVICE"
+            printf 'BUCKET=%q\n'   "$IN_BUCKET"
+            printf 'HEALTH=%q\n'   "$IN_HEALTH"
+            printf 'RUN_USER=%q\n' "$IN_RUN_USER"
+            printf 'MIGRATE=%q\n'  "$IN_MIGRATE"
+            printf 'ENVFILE=%q\n'  "$IN_ENVFILE"
+            printf 'KEEP=%q\n'     "$IN_KEEP"
+            printf 'SETTLE=%q\n'   "$IN_SETTLE"
+          } > /tmp/remote.sh
+
+          # SSM runs the script with /bin/sh, which is dash on Ubuntu, and dash
+          # has no pipefail -- hence the bash shebang written above.
+          cat >> /tmp/remote.sh <<'REMOTE'
 
           PREV="$(readlink -f "$ROOT/current" || true)"
           echo "previous release: ${PREV:-none}"
@@ -269,7 +294,8 @@ jobs:
           rm -rf "$ROOT/releases/$SHA"
           mkdir -p "$ROOT/releases/$SHA"
           tar xzf "/tmp/$PROJECT-$SHA.tar.gz" -C "$ROOT/releases/$SHA" --strip-components=1
-          # An if rather than a bare . That form is safe under
+          # An if rather than a bare [ -n "$RUN_USER" ] && chown. That form is safe
+          # under
           # set -e -- verified, bash does not exit when the failing command is a
           # non-final part of an && list -- but every reader has to stop and
           # check that, which is a poor trade for one saved line.
@@ -316,31 +342,18 @@ jobs:
           ls -1dt "$ROOT/releases/"* | tail -n +$((KEEP + 1)) | xargs -r rm -rf
           REMOTE
 
-          sed -i \
-            -e "s|__SHA__|${{ github.sha }}|g" \
-            -e "s|__ROOT__|${{ inputs.install-root }}|g" \
-            -e "s|__PROJECT__|${{ steps.app.outputs.app }}|g" \
-            -e "s|__SERVICE__|${{ inputs.service }}|g" \
-            -e "s|__BUCKET__|${{ inputs.artifact-bucket }}|g" \
-            -e "s|__HEALTH__|${{ inputs.health-url }}|g" \
-            -e "s|__RUN_USER__|${{ inputs.run-user }}|g" \
-            -e "s|__MIGRATE__|${{ inputs.migrate-command }}|g" \
-            -e "s|__ENVFILE__|${{ inputs.environment-file }}|g" \
-            -e "s|__KEEP__|${{ inputs.keep-releases }}|g" \
-            -e "s|__SETTLE__|${{ inputs.settle-seconds }}|g" \
-            /tmp/remote.sh
 
           # Targeted by tag, not by instance id. The App tag comes from the
           # registry rather than from the caller, so a repository cannot send a
           # command to another app's machine even if it knows the id. It also
           # means adding a second instance needs no change here -- tag it and it
           # is in.
-          APP="${{ steps.app.outputs.app }}"
+          APP="$IN_APP"
           command_id=$(aws ssm send-command \
             --targets "Key=tag:DeployGroup,Values=${{ inputs.deploy-group }}" \
                       "Key=tag:App,Values=$APP" \
             --document-name AWS-RunShellScript \
-            --comment "deploy $APP ${{ github.sha }} by ${{ github.actor }}" \
+            --comment "deploy $APP $IN_SHA by $IN_ACTOR" \
             --parameters commands="$(jq -Rs '[.]' < /tmp/remote.sh)" \
             --query Command.CommandId --output text)
 
