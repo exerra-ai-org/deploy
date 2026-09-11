@@ -343,6 +343,21 @@ jobs:
           REMOTE
 
 
+          # --parameters takes a file, not the shorthand.
+          #
+          # `--parameters commands="$(jq -Rs '[.]' ...)"` looks right and is not:
+          # the shorthand form does not parse JSON, so a correctly escaped JSON
+          # string arrives as a literal one. The script reached the instance as a
+          # single line with backslash-n where every newline should have been,
+          # and SSM reported
+          #
+          #   sh: 1: .../_script.sh: not found
+          #   failed to run commands: exit status 127
+          #
+          # which is what a bad interpreter looks like -- the first line was the
+          # whole script, so the shebang was never a shebang.
+          jq -Rs '{commands: [.]}' < /tmp/remote.sh > /tmp/params.json
+
           # Targeted by tag, not by instance id. The App tag comes from the
           # registry rather than from the caller, so a repository cannot send a
           # command to another app's machine even if it knows the id. It also
@@ -354,7 +369,7 @@ jobs:
                       "Key=tag:App,Values=$APP" \
             --document-name AWS-RunShellScript \
             --comment "deploy $APP $IN_SHA by $IN_ACTOR" \
-            --parameters commands="$(jq -Rs '[.]' < /tmp/remote.sh)" \
+            --parameters file:///tmp/params.json \
             --query Command.CommandId --output text)
 
           echo "ssm command $command_id"
