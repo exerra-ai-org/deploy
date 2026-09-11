@@ -61,3 +61,8 @@ variable "acrm_certificate_arn" {
   type        = string
   default     = null
 }
+
+variable "acrm_frontend_certificate_arn" {
+  description = "ACM certificate for app.acrm.wezerostudio.com, attached to ACRM's existing HTTPS listener."
+  type        = string
+}

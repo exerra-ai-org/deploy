@@ -27,7 +27,17 @@ module "acrm" {
   subnet_ids = slice(sort(data.aws_subnets.default.ids), 0, 2)
 
   container_port = 3005
-  health_path    = "/health"
+  # /healthz/ready, not /health.
+  #
+  # The controller is @Controller('healthz') with a bare @Get() for liveness and
+  # @Get('ready') for readiness. Readiness is the one a load balancer wants: it
+  # checks the database and the dialer, so a task that is running but cannot
+  # reach either stops receiving traffic instead of accepting it and failing.
+  #
+  # /health exists nowhere in this app. It appears in watchdog.service.ts, but
+  # that is ACRM calling the *dialer's* endpoint, which is what made grepping
+  # for "health" misleading.
+  health_path    = "/healthz/ready"
 
   # 0.25 vCPU / 0.5 GB, the smallest Fargate size. About 9 dollars a month.
   # Raise it when the app tells you to, not before.
@@ -66,5 +76,45 @@ output "acrm" {
     service        = module.acrm.service_name
     task_role      = module.acrm.task_role_arn
     execution_role = module.acrm.task_execution_role_arn
+  }
+}
+
+# ---- the frontend -----------------------------------------------------------
+# React Router with ssr: true, so a Node service rather than a static bundle.
+# Attached to ACRM's existing load balancer: a host rule sends
+# app.acrm.wezerostudio.com here and everything else keeps reaching the API.
+module "acrm_frontend" {
+  source = "../../modules/fargate-attached"
+
+  app          = "acrm-frontend"
+  cluster_name = var.ecs_cluster_name
+  vpc_id       = data.aws_vpc.default.id
+  subnet_ids   = slice(sort(data.aws_subnets.default.ids), 0, 2)
+
+  listener_arn          = module.acrm.https_listener_arn
+  alb_security_group_id = module.acrm.alb_security_group_id
+  certificate_arn       = var.acrm_frontend_certificate_arn
+  host_header           = "app.acrm.wezerostudio.com"
+  rule_priority         = 100
+
+  container_port = 3000
+  # react-router-serve has no health endpoint of its own; the app's root is the
+  # thing a browser asks for anyway, so a 200 there is the check that matters.
+  health_path = "/"
+
+  cpu           = 256
+  memory        = 512
+  desired_count = 0
+
+  environment = {
+    NODE_ENV = "production"
+  }
+}
+
+output "acrm_frontend" {
+  value = {
+    ecr     = module.acrm_frontend.ecr_repository_url
+    service = module.acrm_frontend.service_name
+    url     = "https://app.acrm.wezerostudio.com"
   }
 }
