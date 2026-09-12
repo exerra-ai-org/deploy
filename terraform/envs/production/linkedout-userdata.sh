@@ -14,6 +14,20 @@ echo "=== linkedout node bootstrap $(date -Is) ==="
 apt-get update
 apt-get install -y --no-install-recommends curl ca-certificates jq unzip postgresql-client
 
+# The AWS CLI, which Ubuntu's base image does not carry and apt's version is too
+# old to be worth having. The cluster bootstrap reads every secret out of
+# Parameter Store with it, and its absence does not fail loudly: the command
+# substitution returns empty, `set -e` does not fire inside an argument list, and
+# the Kubernetes secret is created holding empty strings. What that produced on
+# the first real run was drizzle-kit reporting `url: ''` -- a malformed
+# connection string, apparently, rather than a missing binary three layers up.
+curl -sfL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update >/dev/null
+ln -sf /usr/local/bin/aws /usr/bin/aws   # SSM commands run with a bare PATH
+rm -rf /tmp/aws /tmp/awscliv2.zip
+aws --version
+
 # The SSM agent is how this box is reached and deployed to. Ubuntu's is a snap,
 # and it is present on Canonical's AMI -- started explicitly because a stopped
 # agent presents as an instance that simply never appears in Systems Manager.
