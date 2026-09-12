@@ -12,7 +12,7 @@ variable "subnet_ids" {
     internet regardless, because its security group only accepts traffic from
     the load balancer.
   EOT
-  type = list(string)
+  type        = list(string)
 }
 
 variable "container_port" {
@@ -61,4 +61,27 @@ variable "certificate_arn" {
 variable "log_retention_days" {
   type    = number
   default = 30
+}
+
+# ---- deployment shape -------------------------------------------------------
+# Defaults are ECS's own: start a replacement before draining the old task, so a
+# deploy causes no downtime. Correct for a stateless web tier and WRONG for a
+# service that must never run twice at once.
+#
+# LinkedOut's API is the second kind. It runs the campaign dispatcher on a timer
+# and holds per-account BullMQ consumers, so two instances means two dispatchers
+# independently deciding the same enrolment is ready -- and the failure is a
+# duplicate LinkedIn invitation to a real person, which cannot be withdrawn. Its
+# Kubernetes manifest says `strategy: Recreate` for exactly this reason; 0/100
+# here is that same decision in ECS terms.
+variable "deployment_minimum_healthy_percent" {
+  description = "0 drains the old task before starting the new one. Use it when two instances must never overlap."
+  type        = number
+  default     = 100
+}
+
+variable "deployment_maximum_percent" {
+  description = "100 forbids a second task during a deploy. Pair with minimum 0, or the deploy cannot proceed at all."
+  type        = number
+  default     = 200
 }

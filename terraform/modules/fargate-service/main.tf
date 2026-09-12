@@ -256,7 +256,7 @@ resource "aws_ecs_task_definition" "this" {
   tags                     = local.tags
 
   container_definitions = jsonencode([{
-    name      = var.app
+    name = var.app
     # Placeholder. The pipeline registers a revision pointing at the real image;
     # ignore_changes on the service below stops Terraform reverting it.
     image     = "public.ecr.aws/nginx/nginx:alpine"
@@ -286,7 +286,7 @@ resource "aws_ecs_service" "this" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets = var.subnet_ids
+    subnets         = var.subnet_ids
     security_groups = [aws_security_group.task.id]
     # Required without a NAT: this is how the task reaches ECR and Parameter
     # Store. Inbound is still closed by the security group.
@@ -303,6 +303,11 @@ resource "aws_ecs_service" "this" {
   # as failed. A Nest app connecting to Supabase on boot needs more than the
   # default zero.
   health_check_grace_period_seconds = 60
+
+  # See variables.tf. Defaults are ECS's own overlapping rollout; 0/100 makes a
+  # deploy stop the old task first, for services where two at once is a defect.
+  deployment_minimum_healthy_percent = var.deployment_minimum_healthy_percent
+  deployment_maximum_percent         = var.deployment_maximum_percent
 
   deployment_circuit_breaker {
     enable   = true

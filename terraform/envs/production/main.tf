@@ -53,8 +53,13 @@ locals {
       lane       = "ecs"
       sub_prefix = "repo:exerra-ai-org@226608819/franchiseOS@1361374692"
     }
+    # The SSM lane, not ECS. LinkedOut deploys by running kubectl on its own
+    # instance through Systems Manager -- the same shape as the dialer, and for
+    # the same reason: no inbound port, no kubeconfig to hold as a secret, and
+    # ssm:SendCommand conditioned on the App and DeployGroup tags so this role
+    # can reach one instance and no other.
     linkedout = {
-      lane       = "ecs"
+      lane       = "ssm"
       sub_prefix = "repo:exerra-ai-org@226608819/linkedout@1337194820"
     }
     rusrus = {
@@ -78,6 +83,12 @@ locals {
       lane       = "ecs"
       sub_prefix = "repo:exerra-ai-org@226608819/ACRM@1335280218"
     }
+
+    # There is no linkedout-portal role. On Fargate the portal was a second
+    # service with its own registry, so a separate role kept a portal deploy from
+    # overwriting the API's image. On one cluster both are Deployments reached by
+    # the same kubectl over the same SSM channel, and a second role would grant
+    # exactly the same thing twice.
   }
 
   # Branches, not tags. job_workflow_ref carries the ref the caller used, so
@@ -86,6 +97,7 @@ locals {
   workflow_refs = [
     "exerra-ai-org/deploy/.github/workflows/ecs.yml@refs/heads/main",
     "exerra-ai-org/deploy/.github/workflows/ssm-release.yml@refs/heads/main",
+    "exerra-ai-org/deploy/.github/workflows/k3s.yml@refs/heads/main",
   ]
 }
 

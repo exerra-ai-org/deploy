@@ -12,3 +12,7 @@ output "https_listener_arn" {
 }
 
 output "alb_security_group_id" { value = aws_security_group.alb.id }
+
+# Exposed so a datastore's security group can name the tasks allowed to reach
+# it, rather than opening a port to the whole VPC.
+output "task_security_group_id" { value = aws_security_group.task.id }
