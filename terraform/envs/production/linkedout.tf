@@ -120,28 +120,60 @@ resource "aws_db_instance" "linkedout" {
   tags = { ManagedBy = "terraform", App = "linkedout" }
 }
 
-# Serverless rather than a node, because the fleet is a handful of accounts and
-# will be zero until proxies arrive. It bills on what is stored and transferred,
-# so an idle queue costs close to nothing where a cache.t4g.micro costs twelve
-# dollars a month to hold nothing.
-resource "aws_elasticache_serverless_cache" "linkedout" {
-  engine = "redis"
-  name   = "linkedout"
+# cache.t4g.micro, about twelve dollars a month.
+#
+# A NODE RATHER THAN SERVERLESS, AND THE FIRST DRAFT HAD THIS WRONG.
+#
+# It said Serverless "because the fleet is zero accounts until proxies arrive and
+# a cache.t4g.micro costs twelve dollars a month to hold nothing". That reasoning
+# only works if Serverless bills near zero when idle, and it does not: it bills
+# stored data with a one gigabyte floor, which is roughly ninety dollars a month
+# before a single command is issued. It was the largest line in the whole stack,
+# to hold a few leases and counters.
+#
+# Serverless is the right answer for a cache whose size swings by orders of
+# magnitude. This one holds per-account action queues, a single-pod lease and a
+# daily cap counter -- tens of kilobytes at the scale this will run at for a
+# year. A node is both cheaper and easier to reason about.
+resource "aws_elasticache_replication_group" "linkedout" {
+  replication_group_id = "linkedout"
+  description          = "LinkedOut queues, leases and cap counters"
 
-  cache_usage_limits {
-    data_storage {
-      maximum = 1
-      unit    = "GB"
-    }
-    ecpu_per_second {
-      maximum = 5000
-    }
-  }
+  engine         = "redis"
+  engine_version = "7.1"
+  node_type      = "cache.t4g.micro"
 
-  security_group_ids = [aws_security_group.linkedout_data.id]
-  subnet_ids         = slice(sort(data.aws_subnets.default.ids), 0, 2)
+  # One node. Redis here is not a cache in front of a database -- it carries the
+  # BullMQ queues, so losing it loses queued actions rather than degrading
+  # performance. That argues for a replica eventually; it does not argue for one
+  # now, while the fleet is zero accounts and a replica doubles the bill.
+  num_cache_clusters = 1
+
+  port                 = 6379
+  subnet_group_name    = aws_elasticache_subnet_group.linkedout.name
+  security_group_ids   = [aws_security_group.linkedout_data.id]
+  parameter_group_name = "default.redis7"
+
+  # In transit only. At-rest encryption on a single-node group holding queue
+  # entries buys little and rules out the cheapest node families later.
+  transit_encryption_enabled = false
+
+  # Snapshots of a queue are of limited use -- a restored queue is a set of
+  # actions somebody already decided not to take an hour ago. Kept at one day so
+  # there is something to look at after an incident, not as a recovery plan.
+  snapshot_retention_limit = 1
+  snapshot_window          = "05:00-06:00"
+  maintenance_window       = "mon:06:00-mon:07:00"
+
+  apply_immediately = false
 
   tags = { ManagedBy = "terraform", App = "linkedout" }
+}
+
+resource "aws_elasticache_subnet_group" "linkedout" {
+  name       = "linkedout"
+  subnet_ids = slice(sort(data.aws_subnets.default.ids), 0, 2)
+  tags       = { ManagedBy = "terraform", App = "linkedout" }
 }
 
 # ---- the API ----------------------------------------------------------------
@@ -237,7 +269,7 @@ output "linkedout" {
     execution_role = module.linkedout.task_execution_role_arn
     url            = "https://api.linkedout.wezerostudio.com"
     database       = aws_db_instance.linkedout.address
-    redis          = aws_elasticache_serverless_cache.linkedout.endpoint
+    redis          = aws_elasticache_replication_group.linkedout.primary_endpoint_address
     # Where the generated master password lives. The application does not use
     # this login -- it connects as app_user, which the migrations create.
     master_secret = aws_db_instance.linkedout.master_user_secret[0].secret_arn
