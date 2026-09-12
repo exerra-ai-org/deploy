@@ -50,6 +50,14 @@ on:
         required: false
         type: string
         default: us-east-1
+      deploy-group:
+        description: >-
+          The DeployGroup tag an instance must carry to be reachable. Half of the
+          addressing and half of the permission boundary: the role's
+          ssm:SendCommand is conditioned on this tag and on App.
+        required: false
+        type: string
+        default: exerra
       namespace:
         required: false
         type: string
@@ -148,27 +156,20 @@ jobs:
           role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/exerra-deploy-${{ steps.app.outputs.app }}-${{ inputs.environment }}
           aws-region: ${{ inputs.aws-region }}
 
-      - name: Find the instance
-        id: instance
-        run: |
-          set -euo pipefail
-          id=$(aws ec2 describe-instances \
-            --filters "Name=tag:App,Values=${{ steps.app.outputs.app }}" \
-                      "Name=tag:DeployGroup,Values=exerra" \
-                      "Name=instance-state-name,Values=running" \
-            --query 'Reservations[].Instances[].InstanceId' --output text)
-
-          # Exactly one. Zero means the tags are wrong or the box is stopped; two
-          # means somebody built a second one and a deploy would land on whichever
-          # the API happened to list first.
-          count=$(echo "$id" | wc -w)
-          if [ "$count" -ne 1 ]; then
-            echo "::error::expected exactly one running instance tagged App=${{ steps.app.outputs.app }}, found $count"
-            exit 1
-          fi
-          echo "id=$id" >> "$GITHUB_OUTPUT"
-          echo "Deploying to $id"
-
+      # NO "find the instance" STEP, AND THAT IS THE POINT.
+      #
+      # The obvious way to reach one box is to look it up by tag with
+      # ec2:DescribeInstances and then send to its id. That fails here, and
+      # should: the deploy role has no EC2 permissions, and ec2:DescribeInstances
+      # supports no resource-level scoping at all -- granting it would hand a
+      # per-app deploy role a read of every instance in the account, to learn one
+      # id it could have been told.
+      #
+      # SendCommand takes --targets with tag filters instead, which is what
+      # ssm-release.yml already does for the dialer. The tags ARE the addressing,
+      # the same tags the role's trust condition is keyed on, so the permission
+      # boundary and the targeting mechanism are the same fact rather than two
+      # facts that must agree.
       - name: Roll the images
         id: roll
         env:
@@ -242,7 +243,8 @@ jobs:
           jq -n --rawfile s /tmp/rollout.sh '{commands: [$s]}' > /tmp/params.json
 
           cmd=$(aws ssm send-command \
-            --instance-ids "${{ steps.instance.outputs.id }}" \
+            --targets "Key=tag:App,Values=${{ steps.app.outputs.app }}" \
+                      "Key=tag:DeployGroup,Values=${{ inputs.deploy-group }}" \
             --document-name AWS-RunShellScript \
             --comment "deploy ${{ steps.commit.outputs.short }}" \
             --timeout-seconds 1200 \
@@ -252,11 +254,44 @@ jobs:
           echo "command=$cmd" >> "$GITHUB_OUTPUT"
           echo "SSM command $cmd"
 
+          # Which instance actually took it. SendCommand against a tag that
+          # matches nothing SUCCEEDS and runs on nothing, so without this a
+          # deploy to a mistyped or missing tag reports success having done
+          # nothing at all.
+          #
+          # Polled, because an instance that has only just registered with SSM
+          # can take a moment to appear in the invocation list even though it was
+          # Online throughout -- a lag indistinguishable from a wrong tag if you
+          # look only once.
+          instances=""
+          for _ in $(seq 1 20); do
+            instances=$(aws ssm list-command-invocations --command-id "$cmd" \
+                          --query 'CommandInvocations[].InstanceId' --output text)
+            [ -n "$instances" ] && break
+            sleep 5
+          done
+
+          if [ -z "$instances" ]; then
+            echo "::error::No instance matched App=${{ steps.app.outputs.app }} DeployGroup=${{ inputs.deploy-group }}."
+            echo "::error::Tag the instance with both, or it cannot be deployed to."
+            exit 1
+          fi
+
+          count=$(echo "$instances" | wc -w)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one instance, found $count: $instances"
+            echo "::error::Two boxes carrying the same tags means two clusters and one of them is stale."
+            exit 1
+          fi
+
+          echo "instance=$instances" >> "$GITHUB_OUTPUT"
+          echo "targeted: $instances"
+
       - name: Wait for it
         run: |
           set -euo pipefail
           cmd="${{ steps.roll.outputs.command }}"
-          id="${{ steps.instance.outputs.id }}"
+          id="${{ steps.roll.outputs.instance }}"
 
           # A moment before the first poll: GetCommandInvocation answers
           # InvocationDoesNotExist for a beat after send-command returns, and a
