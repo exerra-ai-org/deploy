@@ -78,6 +78,15 @@ locals {
       lane       = "ecs"
       sub_prefix = "repo:exerra-ai-org@226608819/ACRM@1335280218"
     }
+
+    # The portal, a second service in the linkedout repository -- same subject
+    # as linkedout above, same reasoning as acrm-frontend: a separate role so a
+    # portal deploy cannot overwrite the API's image, and the API's deploy
+    # cannot touch the portal.
+    linkedout-portal = {
+      lane       = "ecs"
+      sub_prefix = "repo:exerra-ai-org@226608819/linkedout@1337194820"
+    }
   }
 
   # Branches, not tags. job_workflow_ref carries the ref the caller used, so

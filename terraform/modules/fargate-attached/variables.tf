@@ -53,3 +53,14 @@ variable "environment" {
   type    = map(string)
   default = {}
 }
+
+# Named like fargate-service's, because an attached service needs credentials
+# for the same reasons a standalone one does. LinkedOut's portal is the case
+# that forced it: it holds a WorkOS API key and a cookie-encryption password,
+# neither of which belongs in `environment`, which renders in plain text in
+# every console and every describe-task-definition.
+variable "secret_arns" {
+  description = "SSM parameter ARNs as { ENV_NAME = arn }. The execution role is scoped to exactly these."
+  type        = map(string)
+  default     = {}
+}

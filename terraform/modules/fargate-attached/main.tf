@@ -52,6 +52,36 @@ resource "aws_iam_role_policy_attachment" "execution_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# Only this app's own parameters, and only if it has any. The same shape as
+# fargate-service: the managed execution policy grants no ssm:GetParameters at
+# all, so without this a task with `secrets` fails at pull time with a message
+# about the parameter rather than about the role.
+data "aws_iam_policy_document" "execution_secrets" {
+  count = length(var.secret_arns) > 0 ? 1 : 0
+
+  statement {
+    actions   = ["ssm:GetParameters"]
+    resources = values(var.secret_arns)
+  }
+
+  statement {
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${data.aws_region.current.name}.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "execution_secrets" {
+  count  = length(var.secret_arns) > 0 ? 1 : 0
+  name   = "${var.app}-read-own-secrets"
+  role   = aws_iam_role.execution.id
+  policy = data.aws_iam_policy_document.execution_secrets[0].json
+}
+
 resource "aws_iam_role" "task" {
   name               = "${var.app}-ecs-task"
   assume_role_policy = data.aws_iam_policy_document.task_assume.json
@@ -146,6 +176,7 @@ resource "aws_ecs_task_definition" "this" {
     essential    = true
     portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
     environment  = [for k, v in var.environment : { name = k, value = v }]
+    secrets      = [for k, v in var.secret_arns : { name = k, valueFrom = v }]
 
     logConfiguration = {
       logDriver = "awslogs"

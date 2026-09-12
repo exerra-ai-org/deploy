@@ -12,9 +12,9 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 locals {
-  account = data.aws_caller_identity.current.account_id
-  region  = data.aws_region.current.name
-  name    = "exerra-deploy-${var.app}-${var.environment}"
+  account  = data.aws_caller_identity.current.account_id
+  region   = data.aws_region.current.name
+  name     = "exerra-deploy-${var.app}-${var.environment}"
   ecr_repo = var.ecr_namespace == "" ? var.app : "${var.ecr_namespace}/${var.app}"
 }
 
@@ -124,8 +124,8 @@ data "aws_iam_policy_document" "permissions" {
   dynamic "statement" {
     for_each = var.lane == "ssm" ? [1] : []
     content {
-      sid    = "OnlyOwnInstances"
-      effect = "Allow"
+      sid     = "OnlyOwnInstances"
+      effect  = "Allow"
       actions = ["ssm:SendCommand"]
       resources = [
         "arn:aws:ec2:${local.region}:${local.account}:instance/*",

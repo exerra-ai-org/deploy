@@ -37,7 +37,7 @@ module "acrm" {
   # /health exists nowhere in this app. It appears in watchdog.service.ts, but
   # that is ACRM calling the *dialer's* endpoint, which is what made grepping
   # for "health" misleading.
-  health_path    = "/healthz/ready"
+  health_path = "/healthz/ready"
 
   # 0.25 vCPU / 0.5 GB, the smallest Fargate size. About 9 dollars a month.
   # Raise it when the app tells you to, not before.

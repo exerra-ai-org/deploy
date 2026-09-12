@@ -66,3 +66,27 @@ variable "acrm_frontend_certificate_arn" {
   description = "ACM certificate for app.acrm.wezerostudio.com, attached to ACRM's existing HTTPS listener."
   type        = string
 }
+
+variable "linkedout_secret_arns" {
+  description = "SSM parameter ARNs for the LinkedOut API, as { ENV_NAME = arn }. Empty until the parameters exist."
+  type        = map(string)
+  default     = {}
+}
+
+variable "linkedout_portal_secret_arns" {
+  description = "SSM parameter ARNs for the LinkedOut portal. WorkOS key, client id and cookie password."
+  type        = map(string)
+  default     = {}
+}
+
+variable "linkedout_certificate_arn" {
+  description = "ACM certificate for api.linkedout.wezerostudio.com. Null serves plain HTTP."
+  type        = string
+  default     = null
+}
+
+variable "linkedout_portal_certificate_arn" {
+  description = "ACM certificate for linkedout.wezerostudio.com, attached to the API's HTTPS listener."
+  type        = string
+  default     = null
+}
