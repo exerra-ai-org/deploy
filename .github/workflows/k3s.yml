@@ -1,0 +1,294 @@
+# Roll a new image onto a single-node k3s cluster, over Systems Manager.
+#
+#   jobs:
+#     deploy:
+#       uses: exerra-ai-org/deploy/.github/workflows/k3s.yml@main
+#       permissions: { id-token: write, contents: read }
+#       environment: production
+#       with:
+#         aws-account-id: "294342039646"
+#         namespace: linkedout
+#         workloads: |
+#           deployment/linkedout-api=api=ghcr.io/exerra-ai-org/linkedout-api
+#           deployment/linkedout-portal=portal=ghcr.io/exerra-ai-org/linkedout-portal
+#         health-url: https://api.linkedout.wezerostudio.com/health
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY SSM RATHER THAN A KUBECONFIG.
+#
+# The obvious way to deploy to a cluster from CI is to hold a kubeconfig as a
+# secret and point kubectl at the API server. That needs the API server reachable
+# from GitHub's runners -- a public port 6443 on a box whose other job is running
+# a browser against a hostile page -- and it needs a credential that somebody has
+# to rotate and that leaks with the repository.
+#
+# ssm:SendCommand needs no inbound port at all, and the role that may issue it is
+# conditioned on the instance's App and DeployGroup tags, so this workflow can
+# reach one machine and no other. It is the same channel the dialer already
+# deploys over, which also means one fewer idiom in this organisation rather than
+# one more.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      aws-account-id:
+        description: >-
+          Account the role lives in. An input rather than a secret: an account id
+          appears in every ARN in every log, and masking a non-secret is how a
+          wrong value stays invisible.
+        required: true
+        type: string
+      environment:
+        description: >-
+          GitHub environment, which is half of the OIDC subject. The calling job
+          must declare the same one.
+        required: false
+        type: string
+        default: production
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      namespace:
+        required: false
+        type: string
+        default: linkedout
+      workloads:
+        description: >-
+          One per line: <kind/name>=<container>=<image repository>.
+
+          The tag is NOT written here. It is appended by this workflow from the
+          commit being deployed, so a caller cannot pin a workload to an image
+          built from something else.
+        required: true
+        type: string
+      image-tag:
+        description: >-
+          Defaults to sha-<short>, which is what images.yml publishes. `latest`
+          is deliberately not the default: the whole point of deploying a digest
+          or a sha tag is that "what is running" has an answer.
+        required: false
+        type: string
+        default: ''
+      health-url:
+        description: Checked after the rollout. Empty skips it.
+        required: false
+        type: string
+        default: ''
+      rollout-timeout:
+        description: Per workload. The LinkedOut API takes ~3 minutes to boot and prints nothing while it does.
+        required: false
+        type: string
+        default: 6m
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      # The registry is the boundary. A repository not listed here cannot deploy
+      # at all, which is the correct default for a role trusted by an entire
+      # organisation. Kept in step with terraform/envs/production/main.tf's
+      # locals.apps, in the same pull request, because they have to agree.
+      - name: Resolve the calling repository to an app
+        id: app
+        run: |
+          set -euo pipefail
+          cat > /tmp/apps.json <<'REGISTRY'
+          {
+            "exerra-ai-org/linkedout": "linkedout"
+          }
+          REGISTRY
+
+          app=$(jq -r --arg r "${{ github.repository }}" '.[$r] // empty' /tmp/apps.json)
+          if [ -z "$app" ]; then
+            echo "::error::${{ github.repository }} is not registered for the k3s lane."
+            echo "::error::Add it to the registry in exerra-ai-org/deploy and get the change reviewed."
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      # The commit being deployed. On a workflow_run trigger github.sha is the
+      # default branch's head rather than the run that built the image, so the
+      # caller's event decides -- and getting this wrong deploys an image built
+      # from a different commit than the one that asked for it.
+      - name: Resolve the commit
+        id: commit
+        run: |
+          set -euo pipefail
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Derived, never configured. The app comes from the repository, so a
+          # repository cannot name another project's role.
+          role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/exerra-deploy-${{ steps.app.outputs.app }}-${{ inputs.environment }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Find the instance
+        id: instance
+        run: |
+          set -euo pipefail
+          id=$(aws ec2 describe-instances \
+            --filters "Name=tag:App,Values=${{ steps.app.outputs.app }}" \
+                      "Name=tag:DeployGroup,Values=exerra" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+
+          # Exactly one. Zero means the tags are wrong or the box is stopped; two
+          # means somebody built a second one and a deploy would land on whichever
+          # the API happened to list first.
+          count=$(echo "$id" | wc -w)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one running instance tagged App=${{ steps.app.outputs.app }}, found $count"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "Deploying to $id"
+
+      - name: Roll the images
+        id: roll
+        env:
+          TAG: ${{ inputs.image-tag || format('sha-{0}', steps.commit.outputs.short) }}
+          WORKLOADS: ${{ inputs.workloads }}
+          NAMESPACE: ${{ inputs.namespace }}
+          TIMEOUT: ${{ inputs.rollout-timeout }}
+        run: |
+          set -euo pipefail
+
+          # The remote script is assembled as: shebang, four quoted assignments,
+          # then a STATIC body. Nothing in the body is expanded here.
+          #
+          # Both halves of that are scar tissue. Interpolating a GitHub expression
+          # into a shell script is textual substitution, so a value containing a
+          # quote or a backtick is executed -- that is how an earlier deploy in
+          # this organisation ran the contents of a comment. printf %q is the
+          # fix: the runner quotes the value, the box unquotes exactly what was
+          # meant.
+          #
+          # And the body is a quoted heredoc so that $NS, ${ROLLED[@]} and the
+          # rest survive to the remote shell instead of being resolved to nothing
+          # here.
+          {
+            printf '#!/bin/bash\n'
+            printf 'NS=%q\n' "$NAMESPACE"
+            printf 'TAG=%q\n' "$TAG"
+            printf 'TIMEOUT=%q\n' "$TIMEOUT"
+            printf 'WORKLOADS=%q\n' "$WORKLOADS"
+            cat <<'REMOTE'
+          # bash, not sh. SSM runs /bin/sh, which on Ubuntu is dash, where
+          # `set -o pipefail` is "Illegal option" and arrays do not exist.
+          set -euo pipefail
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+          declare -a ROLLED=()
+
+          rollback() {
+              # Undo only what this run actually changed. Rolling back a workload
+              # whose own update never applied would revert whatever WAS running
+              # to the revision before it.
+              for w in "${ROLLED[@]}"; do
+                  echo "rolling back $w"
+                  kubectl -n "$NS" rollout undo "$w" || true
+              done
+              exit 1
+          }
+
+          while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              workload="${line%%=*}"
+              rest="${line#*=}"
+              container="${rest%%=*}"
+              image="${rest#*=}"
+
+              echo "==> $NS $workload -> $image:$TAG"
+              kubectl -n "$NS" set image "$workload" "$container=$image:$TAG"
+              ROLLED+=("$workload")
+              kubectl -n "$NS" rollout status "$workload" --timeout="$TIMEOUT" || rollback
+          done <<< "$WORKLOADS"
+
+          echo "=== deployed ==="
+          kubectl -n "$NS" get deploy -o wide
+          REMOTE
+          } > /tmp/rollout.sh
+
+          # A JSON file and file://, never --parameters commands="..." shorthand.
+          # The shorthand does not parse JSON: it once delivered a whole script as
+          # a single line containing literal backslash-n, and the box answered
+          # "_script.sh: not found", exit 127, naming nothing.
+          jq -n --rawfile s /tmp/rollout.sh '{commands: [$s]}' > /tmp/params.json
+
+          cmd=$(aws ssm send-command \
+            --instance-ids "${{ steps.instance.outputs.id }}" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${{ steps.commit.outputs.short }}" \
+            --timeout-seconds 1200 \
+            --parameters file:///tmp/params.json \
+            --query 'Command.CommandId' --output text)
+
+          echo "command=$cmd" >> "$GITHUB_OUTPUT"
+          echo "SSM command $cmd"
+
+      - name: Wait for it
+        run: |
+          set -euo pipefail
+          cmd="${{ steps.roll.outputs.command }}"
+          id="${{ steps.instance.outputs.id }}"
+
+          # A moment before the first poll: GetCommandInvocation answers
+          # InvocationDoesNotExist for a beat after send-command returns, and a
+          # tight loop turns that into a spurious failure.
+          sleep 5
+
+          for _ in $(seq 1 120); do
+            status=$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$id" \
+                      --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut) ;;
+              *) sleep 10; continue ;;
+            esac
+            break
+          done
+
+          echo "---- stdout ----"
+          aws ssm get-command-invocation --command-id "$cmd" --instance-id "$id" \
+            --query StandardOutputContent --output text || true
+          echo "---- stderr ----"
+          aws ssm get-command-invocation --command-id "$cmd" --instance-id "$id" \
+            --query StandardErrorContent --output text || true
+
+          if [ "$status" != "Success" ]; then
+            echo "::error::rollout $status -- the script rolled back what it had changed"
+            exit 1
+          fi
+
+      # Separate from the rollout on purpose. `rollout status` says the new pods
+      # are ready by the kubelet's reckoning; this says the thing is answering
+      # through its own ingress and TLS, which is what anybody actually means by
+      # "did the deploy work".
+      - name: Check it answers
+        if: inputs.health-url != ''
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${{ inputs.health-url }}" || true)
+            if [ "$code" = "200" ]; then
+              echo "${{ inputs.health-url }} -> 200"
+              exit 0
+            fi
+            echo "attempt $i: $code"
+            sleep 10
+          done
+          echo "::error::${{ inputs.health-url }} never answered 200"
+          exit 1
