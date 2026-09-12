@@ -6,7 +6,7 @@
 #       permissions: { id-token: write, contents: read }
 #       environment: production
 #       with:
-#         aws-account-id: "294342039646"
+#         aws-account-id: "<your-account-id>"
 #         namespace: linkedout
 #         workloads: |
 #           deployment/linkedout-api=api=ghcr.io/exerra-ai-org/linkedout-api

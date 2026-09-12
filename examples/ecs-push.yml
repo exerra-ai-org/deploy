@@ -17,6 +17,6 @@ jobs:
   deploy:
     uses: exerra-ai-org/deploy/.github/workflows/ecs.yml@main
     with:
-      aws-account-id: "294342039646"
+      aws-account-id: "<your-account-id>"
       cluster: agency-prod
       health-url: https://api.example.com/health
