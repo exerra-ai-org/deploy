@@ -76,6 +76,19 @@ on:
         required: false
         type: string
         default: ''
+      health-status:
+        description: >-
+          The status code that means healthy. 200 for most things; a portal whose
+          every public path is an auth redirect answers 3xx and never 200, and
+          hard-coding 200 there fails every deploy of a working service.
+
+          A redirect can be the stronger signal: a 307 carrying a real
+          authorization URL proves the ingress routed, TLS terminated, the server
+          ran its middleware AND its identity provider configuration is valid --
+          where a 200 on a static page proves only that something is listening.
+        required: false
+        type: string
+        default: '200'
       rollout-timeout:
         description: Per workload. The LinkedOut API takes ~3 minutes to boot and prints nothing while it does.
         required: false
@@ -279,16 +292,22 @@ jobs:
       # "did the deploy work".
       - name: Check it answers
         if: inputs.health-url != ''
+        env:
+          URL: ${{ inputs.health-url }}
+          WANT: ${{ inputs.health-status }}
         run: |
           set -euo pipefail
+          # --max-redirs 0, so a redirect is OBSERVED rather than followed. The
+          # portal's sign-in path redirects to the identity provider; following
+          # it would report on WorkOS's availability instead of ours.
           for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${{ inputs.health-url }}" || true)
-            if [ "$code" = "200" ]; then
-              echo "${{ inputs.health-url }} -> 200"
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --max-redirs 0 "$URL" || true)
+            if [ "$code" = "$WANT" ]; then
+              echo "$URL -> $code"
               exit 0
             fi
-            echo "attempt $i: $code"
+            echo "attempt $i: $code (want $WANT)"
             sleep 10
           done
-          echo "::error::${{ inputs.health-url }} never answered 200"
+          echo "::error::$URL never answered $WANT"
           exit 1
