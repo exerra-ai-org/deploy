@@ -266,6 +266,59 @@ resource "aws_db_subnet_group" "linkedout" {
   tags       = local.linkedout_tags
 }
 
+# pgaudit, which the API refuses to start without.
+#
+# PgAuditCheckService is an onApplicationBootstrap hook that throws:
+#
+#     AUDT-02: refusing to start -- the pgaudit extension is not installed on
+#     this database.
+#
+# That is a deliberate refusal and the right one: auditing that is believed to be
+# on and is not is worse than auditing known to be off. drizzle/init/01_setup.sql
+# creates the extension for local Docker and says in its own comment that a
+# managed provider needs the parameter group instead. This is that.
+#
+# A custom group is required rather than preferred: shared_preload_libraries is a
+# STATIC parameter, AWS does not permit editing a default group at all, and a
+# static change only takes effect on reboot. So the order is create group ->
+# attach -> reboot -> CREATE EXTENSION, and skipping the reboot leaves
+# CREATE EXTENSION failing with a message about the library not being loaded.
+resource "aws_db_parameter_group" "linkedout" {
+  name        = "linkedout-postgres16"
+  family      = "postgres16"
+  description = "LinkedOut: pgaudit preloaded, AUDT-02"
+
+  parameter {
+    name = "shared_preload_libraries"
+    # The default group's two are kept. Replacing rather than appending would
+    # silently drop pg_stat_statements, which nothing would report.
+    value        = "pg_stat_statements,pg_tle,pgaudit"
+    apply_method = "pending-reboot"
+  }
+
+  # Write and DDL, not read. Logging every SELECT on this database would record
+  # the content of every prospect list and every message body into CloudWatch,
+  # which moves the confidentiality problem rather than solving it -- and buries
+  # the DDL somebody actually needs to find.
+  parameter {
+    name         = "pgaudit.log"
+    value        = "ddl,role,write"
+    apply_method = "pending-reboot"
+  }
+
+  # Log the parameter values, so an audit entry says which row was changed rather
+  # than only that a statement of some shape ran.
+  parameter {
+    name         = "pgaudit.log_parameter"
+    value        = "1"
+    apply_method = "pending-reboot"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 resource "aws_db_instance" "linkedout" {
   identifier     = "linkedout"
   engine         = "postgres"
@@ -286,6 +339,7 @@ resource "aws_db_instance" "linkedout" {
   db_subnet_group_name   = aws_db_subnet_group.linkedout.name
   vpc_security_group_ids = [aws_security_group.linkedout_data.id]
   publicly_accessible    = false
+  parameter_group_name   = aws_db_parameter_group.linkedout.name
 
   backup_retention_period = 7
   backup_window           = "03:00-04:00"
