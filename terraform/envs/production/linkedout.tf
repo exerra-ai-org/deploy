@@ -69,10 +69,38 @@ variable "linkedout_instance_type" {
   default = "m6i.large"
 }
 
+# Not every availability zone offers every instance type, and the default VPC has
+# a subnet in all of them. Taking the first subnet by sort order put this in
+# us-east-1e, which offers no m6i at all -- RunInstances refused with
+# "Unsupported: Your requested instance type (m6i.large) is not supported in your
+# requested Availability Zone", after the database had already been created.
+#
+# So the zone is derived from where the instance type is actually offered, rather
+# than chosen and hoped for. This also survives a change to
+# linkedout_instance_type, which a hardcoded subnet id would not.
+data "aws_ec2_instance_type_offerings" "linkedout" {
+  filter {
+    name   = "instance-type"
+    values = [var.linkedout_instance_type]
+  }
+  location_type = "availability-zone"
+}
+
+data "aws_subnets" "linkedout_instance" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = data.aws_ec2_instance_type_offerings.linkedout.locations
+  }
+}
+
 resource "aws_instance" "linkedout" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.linkedout_instance_type
-  subnet_id              = sort(data.aws_subnets.default.ids)[0]
+  subnet_id              = sort(data.aws_subnets.linkedout_instance.ids)[0]
   vpc_security_group_ids = [aws_security_group.linkedout.id]
   iam_instance_profile   = aws_iam_instance_profile.linkedout.name
 
