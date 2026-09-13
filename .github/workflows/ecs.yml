@@ -103,6 +103,36 @@ on:
         required: false
         type: string
         default: Dockerfile
+      migrate-command:
+        description: >-
+          Shell run on the runner, from the checked-out repository, AFTER the
+          image is pushed and BEFORE the service is updated. Empty skips it.
+
+          If it fails the deploy stops there: the old task keeps serving against
+          the old schema, which is the correct failure. A half-migrated database
+          with the previous code on top is recoverable; new code against a schema
+          that cannot serve it is an outage that health checks do not catch.
+
+          Kept as arbitrary shell rather than a built-in migration runner because
+          every app here migrates differently -- Supabase SQL, Ecto, drizzle-kit --
+          and a shared workflow that knows about any one of them would have to
+          know about all of them. The caller supplies a script; this only decides
+          WHEN it runs and what happens when it does not.
+        required: false
+        type: string
+        default: ''
+      migrate-parameters:
+        description: >-
+          SSM parameters to put in that command's environment, one NAME=/path per
+          line. Read with the deploy role, masked in the log, and never written to
+          disk.
+
+          A migration needs a database credential that the application itself does
+          not hold -- the app connects as a restricted role, migrations as the one
+          that owns the DDL -- so it cannot simply reuse the task's secrets.
+        required: false
+        type: string
+        default: ''
       health-url:
         description: >-
           Optional URL to check after the service stabilises. A stable service is
@@ -278,6 +308,63 @@ jobs:
 
       # Read before writing. This is what the service goes back to if the new
       # revision does not come up.
+      # ── MIGRATIONS, BEFORE ANY NEW CODE STARTS ──────────────────────────────
+      #
+      # This step exists because its absence caused an outage. ACRM shipped a
+      # guard that reads organizations.status -- a column its own migration
+      # creates -- and the migration was never applied, because nothing applied
+      # migrations. Every authenticated request answered 401 "Unable to establish
+      # tenant" for two hours, while /healthz/ready stayed green throughout,
+      # because readiness queried a column that DID exist.
+      #
+      # Ordering is the whole point. The migration runs after the image is built
+      # (so a broken build never touches the database) and before the service is
+      # updated (so no new code ever meets an old schema). A failure here stops
+      # the deploy with the old task still serving.
+      - name: Migrate
+        if: inputs.migrate-command != ''
+        env:
+          IN_MIGRATE: ${{ inputs.migrate-command }}
+          IN_PARAMS: ${{ inputs.migrate-parameters }}
+        run: |
+          set -euo pipefail
+
+          # Parameters are fetched one at a time and masked before anything can
+          # print them. ::add-mask:: has to come before the value is used, not
+          # after -- a masked value is only masked from the moment it is
+          # registered, and a batch fetch that fails mid-way can echo the ones it
+          # already read.
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            name="${line%%=*}"
+            path="${line#*=}"
+            value=$(aws ssm get-parameter --name "$path" --with-decryption \
+                      --query Parameter.Value --output text)
+            if [ -z "$value" ] || [ "$value" = "None" ]; then
+              echo "::error::$path is empty or missing"
+              exit 1
+            fi
+            echo "::add-mask::$value"
+            # export, NOT $GITHUB_ENV. Writing to GITHUB_ENV sets a variable for
+            # the steps that come AFTER this one -- which is every step except the
+            # one that needs it. Tested with a stub: the migration ran with the
+            # variable unset and would have failed on its own guard clause.
+            #
+            # It also keeps the credential to this step. A database password in
+            # GITHUB_ENV is in the environment of the health check, the rollback
+            # and anything added later, none of which has any use for it.
+            export "$name=$value"
+            echo "  $name <- $path"
+          done <<< "$IN_PARAMS"
+
+          echo "==> $IN_MIGRATE"
+          # env, not interpolation. A GitHub expression substituted into a shell
+          # script is textual: the dialer's
+          #   ./bin/dialer eval "Dialer.Release.migrate()"
+          # died on its bare parentheses, and an earlier attempt to fix it by
+          # unquoting a heredoc executed a backtick inside a comment.
+          bash -c "$IN_MIGRATE"
+
       - name: Note what is running now
         id: previous
         run: |

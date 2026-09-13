@@ -188,6 +188,35 @@ data "aws_iam_policy_document" "permissions" {
     }
   }
 
+  # A migration needs a credential the application does not hold: the app connects
+  # as a restricted role, migrations as the one that owns the DDL. Scoped to this
+  # app's own prefix, so the linkedout role cannot read ACRM's connection string
+  # any more than it can deploy ACRM's service.
+  dynamic "statement" {
+    for_each = var.lane == "ecs" ? [1] : []
+    content {
+      sid       = "ReadOwnMigrationSecrets"
+      effect    = "Allow"
+      actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+      resources = ["arn:aws:ssm:${local.region}:${local.account}:parameter/${var.app}/*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.lane == "ecs" ? [1] : []
+    content {
+      sid       = "DecryptOwnMigrationSecrets"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt"]
+      resources = ["*"]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ssm.${local.region}.amazonaws.com"]
+      }
+    }
+  }
+
   dynamic "statement" {
     for_each = var.lane == "ecs" && var.ecs_cluster_name != null ? [1] : []
     content {
